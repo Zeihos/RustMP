@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use rustmp_protocol::legacy_frame::{decode_datagram, Reliability};
 use rustmp_transport::preauth::{PreAuthExchange, RetryResult};
+use rustmp_transport::cookie::{CookieGate, CookieVerdict, ID_OPEN_CONNECTION_REQUEST};
 use rustmp_transport::{LegacyWireProfile, OfflineGateway};
 
 const BEGINS_PER_IP_PER_SECOND: u16 = 4;
@@ -24,6 +25,8 @@ struct Rate {
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeStats {
+    pub cookie_challenges: u64,
+    pub cookie_validations: u64,
     pub starts: u64,
     pub transport_confirmations: u64,
     pub rejected: u64,
@@ -35,6 +38,7 @@ pub struct ProbeStats {
 #[derive(Default)]
 pub struct ExperimentalPreAuth {
     exchange: PreAuthExchange,
+    cookie: CookieGate,
     rates: HashMap<IpAddr, Rate>,
     stats: ProbeStats,
     next_index: u16,
@@ -44,6 +48,43 @@ impl ExperimentalPreAuth {
     pub fn new() -> Self { Self::default() }
     pub fn pending_count(&self) -> usize { self.exchange.len() }
     pub fn stats(&self) -> ProbeStats { self.stats }
+
+    /// Intercept open.mp fork's three-byte offline open before OfflineGateway
+    /// can allocate any pending slot. The cookie is bound to IPv4 address and
+    /// valid across source-port changes, mirroring the legacy fork's wire
+    /// exchange. This is a localhost diagnostic, NOT a cryptographic login.
+    ///
+    /// Ok(()) lets the normal offline gateway process the packet.
+    /// Err(bytes) means it was consumed; empty bytes indicate silent denial.
+    pub fn check_cookie(
+        &mut self, bytes: &[u8], peer: SocketAddr, now: Instant,
+        offline: &OfflineGateway,
+    ) -> Result<(), Vec<u8>> {
+        if bytes.len() != 3 || bytes[0] != ID_OPEN_CONNECTION_REQUEST {
+            return Ok(());
+        }
+        if !peer.ip().is_loopback() || !peer.is_ipv4() {
+            self.stats.rejected += 1;
+            return Err(Vec::new());
+        }
+        if offline.pending_profile(peer, now)
+            .is_some_and(|profile| profile != LegacyWireProfile::OpenMpRakNet)
+        {
+            self.stats.rejected += 1;
+            return Err(Vec::new());
+        }
+        match self.cookie.check(peer, bytes) {
+            Some(CookieVerdict::Challenge(bytes)) => {
+                self.stats.cookie_challenges += 1;
+                Err(bytes.to_vec())
+            }
+            Some(CookieVerdict::Valid(_)) => {
+                self.stats.cookie_validations += 1;
+                Ok(())
+            }
+            None => Err(Vec::new()),
+        }
+    }
 
     fn allowed(&mut self, peer: SocketAddr, now: Instant) -> bool {
         let ip = peer.ip();
@@ -198,6 +239,33 @@ mod tests {
         assert_eq!(router.pending_count(),0);
         assert_eq!(router.stats().transport_confirmations,1);
         assert_eq!(gateway.pending_count(),0);
+    }
+
+    #[test]
+    fn cookie_gate_requires_valid_openmp_retry_before_offline_slot() {
+        use rustmp_transport::cookie::{CookieFlavor, ID_OPEN_CONNECTION_COOKIE};
+        let now=Instant::now();
+        let client=peer(52010);
+        let mut gateway=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let wrong=router.check_cookie(&[24,0,0],client,now,&gateway).unwrap_err();
+        assert_eq!(wrong.len(),3);
+        assert_eq!(wrong[0],ID_OPEN_CONNECTION_COOKIE);
+        assert_eq!(gateway.pending_count(),0);
+        let token=u16::from_le_bytes([wrong[1],wrong[2]]);
+        let [lo,hi]=(token ^ 0x6D70).to_le_bytes();
+        assert_eq!(router.check_cookie(&[24,lo,hi],client,now,&gateway),Ok(()));
+        let reply=gateway.handle(&[24,lo,hi],client,now);
+        assert_eq!(reply,Some(vec![25,0]));
+        assert_eq!(gateway.pending_count(),1);
+        assert_eq!(router.stats().cookie_challenges,1);
+        assert_eq!(router.stats().cookie_validations,1);
+
+        let samp=router.cookie.encode_request(client,CookieFlavor::OriginalSamp).unwrap();
+        assert_eq!(router.check_cookie(&samp,client,now,&gateway),Ok(()));
+        assert_eq!(router.handle(&packet(0,&[11],&[]),client,peer(7777),
+            &mut gateway,b"",now),Vec::<Vec<u8>>::new());
+        assert_eq!(router.pending_count(),0); // open.mp game auth still disabled
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod openmp_legacy_id {
     pub const AUTH_KEY: u8 = 12;
     pub const OPEN_CONNECTION_REQUEST: u8 = 24;
     pub const OPEN_CONNECTION_REPLY: u8 = 25;
+    pub const OPEN_CONNECTION_COOKIE: u8 = 26;
     pub const CONNECTION_ATTEMPT_FAILED: u8 = 29;
     pub const NO_FREE_INCOMING_CONNECTIONS: u8 = 31;
     pub const PONG: u8 = 39;
@@ -438,3 +439,6 @@ pub mod handshake;
 
 /// Bounded reliable handshake exchange, library-only pending client capture.
 pub mod preauth;
+
+/// Local-only legacy cookie wire challenge; NOT game authentication.
+pub mod cookie;

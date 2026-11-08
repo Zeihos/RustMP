@@ -2,6 +2,9 @@
 //! This build answers SA-MP legacy UDP queries and pre-connection packets.
 //! It does NOT accept game clients.
 
+mod experimental;
+
+use experimental::ExperimentalPreAuth;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -94,7 +97,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-RUSTMP server prototype 0.2.0-alpha.11 (NOT gameplay-compatible yet)\n\
+RUSTMP server prototype 0.2.0-alpha.12 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\
@@ -104,8 +107,9 @@ Usage: cargo run --release -p rustmp-server -- [options]\n\
   --language TEXT      Language string\n\
   --max-players N      Maximum players (currently query metadata only)\n\
   --encoding 1251|1252 Legacy server query text encoding\n\
+  --experimental-preauth  LOCAL TEST ONLY: enable SA-MP reliable handshake on IPv4 loopback\n\
   --help               Show this help\n\
-Legacy RakNet offline probes only; no reliable session, Pawn VM or gameplay yet.\n");
+Default: offline-only. Experimental localhost pre-auth is not a game session; no Pawn VM or gameplay.\n");
 }
 
 fn parse_options(args: &[String]) -> Result<Option<Config>, Box<dyn Error>> {
@@ -151,6 +155,28 @@ fn parse_options(args: &[String]) -> Result<Option<Config>, Box<dyn Error>> {
     Ok(Some(cfg))
 }
 
+/// An explicitly enabled experimental mode cannot be bound to a public
+/// socket: it lacks the verified cookie/authentication part of the protocol.
+fn experimental_bind_allowed(address: SocketAddr) -> bool {
+    address.is_ipv4() && address.ip().is_loopback()
+}
+
+fn parse_runtime_options(args: &[String])
+    -> Result<(Option<Config>, bool), Box<dyn Error>>
+{
+    let mut experimental = false;
+    let mut rest = Vec::new();
+    for arg in args {
+        if arg == "--experimental-preauth" {
+            if experimental { return Err("--experimental-preauth may be specified once".into()); }
+            experimental = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    Ok((parse_options(&rest)?, experimental))
+}
+
 /// Multiplex SA-MP query and legacy offline RakNet on one UDP port.
 /// This does not handle authenticated, encrypted or reliable game traffic.
 fn respond_to_datagram(
@@ -170,18 +196,59 @@ fn respond_to_datagram(
     }
 }
 
-fn run(config: Config) -> Result<(), Box<dyn Error>> {
+/// Common UDP router. Production mode remains query+offline only.
+/// The experimental handler runs exclusively on an explicitly selected
+/// IPv4 loopback socket; it never registers an authenticated game player.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_datagram(
+    incoming: &[u8], peer: SocketAddr, now: Instant,
+    world: &World, query_limits: &mut HashMap<IpAddr, RateLimit>,
+    offline: &mut OfflineGateway, mut experimental: Option<&mut ExperimentalPreAuth>,
+    bound: SocketAddr,
+) -> Vec<Vec<u8>> {
+    // Cookie gate must precede OfflineGateway::handle: otherwise open.mp
+    // would allocate a pending peer and send OPEN_CONNECTION_REPLY before
+    // validating the cookie. Default (non-experimental) mode is untouched.
+    if let Some(router) = experimental.as_deref_mut() {
+        if let Err(reply) = router.check_cookie(incoming, peer, now, offline) {
+            return if reply.is_empty() { Vec::new() } else { vec![reply] };
+        }
+    }
+    if let Some(reply) = respond_to_datagram(
+        incoming, peer, now, world, query_limits, offline,
+    ) { return vec![reply]; }
+    if incoming.starts_with(b"SAMP") { return Vec::new(); }
+    match experimental {
+        Some(router) => router.handle(
+            incoming, peer, bound, offline,
+            world.config.password.as_deref().unwrap_or("").as_bytes(), now,
+        ),
+        None => Vec::new(),
+    }
+}
+
+fn run(config: Config, experimental_preauth: bool) -> Result<(), Box<dyn Error>> {
+
     let socket = UdpSocket::bind((config.bind.as_str(), config.port))?;
     socket.set_nonblocking(true)?;
     let addr = socket.local_addr()?;
+    if experimental_preauth && !experimental_bind_allowed(addr) {
+        return Err("--experimental-preauth requires --bind 127.0.0.1 (IPv4 loopback only)".into());
+    }
     println!("[RUST] UDP query and RakNet offline bootstrap listening on {addr}");
     println!("[RUST] {} (max players {})", config.hostname, config.max_players);
-    eprintln!("[NOTICE] Query + legacy RakNet offline replies only. Gameplay clients CANNOT join.");
+    if experimental_preauth {
+        eprintln!("[EXPERIMENTAL] localhost-only SA-MP pre-auth probe ENABLED. No game auth or player login.");
+        eprintln!("[EXPERIMENTAL] open.mp auth-table/cookie path NOT supported; no public bind permitted.");
+    } else {
+        eprintln!("[NOTICE] Query + legacy RakNet offline replies only. Gameplay clients CANNOT join.");
+    }
     println!("[RUST] Stop with Ctrl+C.");
 
     let mut world = World::new(config);
     let mut limits = HashMap::<IpAddr, RateLimit>::new();
     let mut offline = OfflineGateway::new(world.config.max_players as usize);
+    let mut experimental = experimental_preauth.then(ExperimentalPreAuth::new);
     let mut buffer = [0u8; 2048];
     let mut last_cleanup = Instant::now();
     let mut last_report = Instant::now();
@@ -192,11 +259,12 @@ fn run(config: Config) -> Result<(), Box<dyn Error>> {
         for _ in 0..256 {
             match socket.recv_from(&mut buffer) {
                 Ok((length, peer)) => {
-                    let reply = respond_to_datagram(
+                    let replies = dispatch_datagram(
                         &buffer[..length], peer, Instant::now(),
                         &world, &mut limits, &mut offline,
+                        experimental.as_mut(), addr,
                     );
-                    if let Some(reply) = reply {
+                    for reply in replies {
                         if let Err(e) = socket.send_to(&reply, peer) {
                             eprintln!("[WARN] UDP reply to {peer} failed: {e}");
                         }
@@ -208,10 +276,19 @@ fn run(config: Config) -> Result<(), Box<dyn Error>> {
             }
         }
         world.tick();
+        if let Some(probe) = experimental.as_mut() {
+            let retries = probe.poll_retries(Instant::now());
+            for packet in retries.packets {
+                if let Err(e) = socket.send_to(&packet.bytes, packet.peer) {
+                    eprintln!("[WARN] pre-auth resend to {} failed: {e}", packet.peer);
+                }
+            }
+        }
         if last_cleanup.elapsed() >= Duration::from_secs(1) {
             let now = Instant::now();
             limits.retain(|_, limit| now.duration_since(limit.window_start) < Duration::from_secs(2));
             offline.cleanup(now);
+            if let Some(probe) = experimental.as_mut() { probe.cleanup(now); }
             last_cleanup = now;
         }
         if last_report.elapsed() >= Duration::from_secs(60) {
@@ -219,6 +296,13 @@ fn run(config: Config) -> Result<(), Box<dyn Error>> {
             println!("[NET] offline pings={} opens={} pending={} full={} throttled={} expired={}",
                 stats.pings_replied, stats.opens_replied, offline.pending_count(),
                 stats.denied_full, stats.rate_limited, stats.expired_pending);
+            if let Some(probe) = experimental.as_ref() {
+                let pre = probe.stats();
+                println!("[NET] localhost pre-auth cookies={} validated={} starts={} confirmed={} rejected={} throttled={} pending={}",
+                    pre.cookie_challenges, pre.cookie_validations, pre.starts,
+                    pre.transport_confirmations, pre.rejected,
+                    pre.throttled, probe.pending_count());
+            }
             last_report = Instant::now();
         }
         if let Some(remaining) = TICK_INTERVAL.checked_sub(frame_start.elapsed()) {
@@ -229,14 +313,14 @@ fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
-    match parse_options(&args) {
-        Ok(Some(cfg)) => {
-            if let Err(err) = run(cfg) {
+    match parse_runtime_options(&args) {
+        Ok((Some(cfg), experimental)) => {
+            if let Err(err) = run(cfg, experimental) {
                 eprintln!("[ERROR] {err}");
                 std::process::exit(1);
             }
         }
-        Ok(None) => {}
+        Ok((None, _)) => {}
         Err(err) => {
             eprintln!("[ERROR] {err}");
             eprintln!("Run with --help for supported options.");
@@ -305,6 +389,159 @@ mod tests {
         assert_eq!(&reply[..request.len()], request);
         assert_eq!(&reply[12..14], &0u16.to_le_bytes());
         assert_eq!(offline.pending_count(), 1); // Query never allocates peers.
+    }
+
+    #[test]
+    fn experimental_bind_and_cli_are_explicit() {
+        let opts: Vec<_>=["--bind","127.0.0.1","--experimental-preauth"].iter()
+            .map(|s|s.to_string()).collect();
+        let (cfg, enabled)=parse_runtime_options(&opts).unwrap();
+        assert!(enabled);
+        assert_eq!(cfg.unwrap().bind,"127.0.0.1");
+        assert!(experimental_bind_allowed("127.0.0.1:7777".parse().unwrap()));
+        assert!(!experimental_bind_allowed("0.0.0.0:7777".parse().unwrap()));
+        assert!(!experimental_bind_allowed("192.0.2.1:7777".parse().unwrap()));
+        assert!(!experimental_bind_allowed("[::1]:7777".parse().unwrap()));
+        let doubles:Vec<_>=["--experimental-preauth","--experimental-preauth"]
+            .iter().map(|s|s.to_string()).collect();
+        assert!(parse_runtime_options(&doubles).is_err());
+    }
+
+    #[test]
+    fn loopback_udp_socket_can_exchange_reliable_test_handshake() {
+        use rustmp_protocol::legacy_frame::{decode_datagram, encode_datagram, Frame, Reliability};
+        let socket=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let bound=socket.local_addr().unwrap();
+        let mut config=Config::default();
+        config.bind="127.0.0.1".to_string();
+        let world=World::new(config);
+        let mut query_limits=HashMap::new();
+        let mut offline=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let now=Instant::now();
+        let mut buf=[0u8;2048];
+
+        client.send_to(&[16,0,0],bound).unwrap();
+        let (n,peer)=socket.recv_from(&mut buf).unwrap();
+        let replies=dispatch_datagram(&buf[..n],peer,now,&world,
+            &mut query_limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(replies,vec![vec![17,0]]);
+        socket.send_to(&replies[0],peer).unwrap();
+        let (n,_) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n],&[17,0]);
+
+        let request=encode_datagram(&[], &[Frame{
+            sequence:0,reliability:Reliability::Reliable,ordering:None,
+            payload_bits:8,payload:vec![8],split:None,
+        }]).unwrap();
+        client.send_to(&request,bound).unwrap();
+        let (n,peer)=socket.recv_from(&mut buf).unwrap();
+        let replies=dispatch_datagram(&buf[..n],peer,now,&world,
+            &mut query_limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(replies.len(),1);
+        socket.send_to(&replies[0],peer).unwrap();
+        let (n,_) = client.recv_from(&mut buf).unwrap();
+        let accepted=decode_datagram(&buf[..n]).unwrap();
+        assert_eq!(accepted.acknowledgements[0].start,0);
+        assert_eq!(accepted.frames[0].payload[0],23);
+        // No verified players are added while testing transport exchange.
+        assert_eq!(world.query_snapshot().players.len(),0);
+
+        let mut confirmation=vec![26,127,0,0,1];
+        confirmation.extend_from_slice(&bound.port().to_le_bytes());
+        let final_frame=Frame{
+            sequence:1,reliability:Reliability::Reliable,ordering:None,
+            payload_bits:(confirmation.len()*8) as u16,
+            payload:confirmation,split:None,
+        };
+        let final_wire=encode_datagram(&[0],&[final_frame]).unwrap();
+        client.send_to(&final_wire,bound).unwrap();
+        let (n,peer)=socket.recv_from(&mut buf).unwrap();
+        let replies=dispatch_datagram(&buf[..n],peer,now,&world,
+            &mut query_limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(replies.len(),1);
+        socket.send_to(&replies[0],peer).unwrap();
+        let (n,_) = client.recv_from(&mut buf).unwrap();
+        let final_ack=decode_datagram(&buf[..n]).unwrap();
+        assert_eq!(final_ack.acknowledgements[0].start,1);
+        assert_eq!(router.stats().transport_confirmations,1);
+        assert_eq!(router.pending_count(),0);
+        assert!(world.query_snapshot().players.is_empty());
+    }
+
+    #[test]
+    fn disabled_probe_never_answers_reliable_connect_request() {
+        use rustmp_protocol::legacy_frame::{encode_datagram, Frame, Reliability};
+        let now=Instant::now();
+        let client:SocketAddr="127.0.0.1:43210".parse().unwrap();
+        let bound:SocketAddr="127.0.0.1:7777".parse().unwrap();
+        let world=World::new(Config::default());
+        let mut limits=HashMap::new();
+        let mut offline=OfflineGateway::new(5);
+        let opening=dispatch_datagram(&[16,0,0],client,now,&world,
+            &mut limits,&mut offline,None,bound);
+        assert_eq!(opening,vec![vec![17,0]]);
+        let packet=encode_datagram(&[],&[Frame{
+            sequence:0,reliability:Reliability::Reliable,ordering:None,
+            payload_bits:8,payload:vec![8],split:None,
+        }]).unwrap();
+        assert!(dispatch_datagram(&packet,client,now,&world,
+            &mut limits,&mut offline,None,bound).is_empty());
+        assert!(!offline.saw_reliable_request(client));
+    }
+
+    #[test]
+    fn openmp_cookie_challenge_happens_before_allocating_peer() {
+        let world=World::new(Config::default());
+        let mut limits=HashMap::new();
+        let mut offline=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let now=Instant::now();
+        let peer:SocketAddr="127.0.0.1:54000".parse().unwrap();
+        let server:SocketAddr="127.0.0.1:7777".parse().unwrap();
+
+        let initial=dispatch_datagram(&[24,0,0],peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),server);
+        assert_eq!(initial.len(),1);
+        assert_eq!(initial[0].len(),3);
+        assert_eq!(initial[0][0],26);
+        assert_eq!(offline.pending_count(),0);
+
+        let cookie=u16::from_le_bytes([initial[0][1],initial[0][2]]);
+        let [lo,hi]=(cookie ^ 0x6d70).to_le_bytes();
+        let valid=dispatch_datagram(&[24,lo,hi],peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),server);
+        assert_eq!(valid,vec![vec![25,0]]);
+        assert_eq!(offline.pending_count(),1);
+        assert_eq!(router.stats().cookie_challenges,1);
+        assert_eq!(router.stats().cookie_validations,1);
+
+        // No authentic open.mp auth table is installed, so we never issue
+        // a fabricated reliable challenge, and never admit a game player.
+        use rustmp_protocol::legacy_frame::{encode_datagram,Frame,Reliability};
+        let req=encode_datagram(&[],&[Frame{
+            sequence:0,reliability:Reliability::Reliable,ordering:None,
+            payload_bits:8,payload:vec![11],split:None
+        }]).unwrap();
+        let replies=dispatch_datagram(&req,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),server);
+        assert!(replies.is_empty());
+        assert_eq!(router.pending_count(),0);
+        assert!(world.query_snapshot().players.is_empty());
+    }
+
+    #[test]
+    fn localhost_probe_is_actually_in_main_and_disabled_by_default() {
+        // Regression: alpha.11 included experimental.rs but main.rs did not
+        // invoke the dispatcher. Keep direct coverage of both CLI branches.
+        let selected=vec!["--bind".to_string(),"127.0.0.1".to_string(),
+            "--experimental-preauth".to_string()];
+        assert!(parse_runtime_options(&selected).unwrap().1);
+        let normal=vec!["--bind".to_string(),"127.0.0.1".to_string()];
+        assert!(!parse_runtime_options(&normal).unwrap().1);
     }
 
     #[test]

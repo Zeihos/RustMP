@@ -19,3 +19,6 @@ jobs:
         run: cargo check --locked --workspace --all-targets
       - name: Unit tests
         run: cargo test --locked --workspace
+
+      - name: Check server command-line entry point
+        run: cargo run --locked -p rustmp-server -- --help
