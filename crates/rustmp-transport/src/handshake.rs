@@ -378,7 +378,7 @@ mod tests {
         let mut offline=OfflineGateway::new(4);
         prepare(&mut offline,peer(20003),LegacyWireProfile::Samp037,b"bad",now);
         let mut h=HandshakeCoordinator::new();
-        assert_eq!(h.begin(&offline,peer(20003),&[8,b'b',b'a',b'd'],b"good",
+        assert_eq!(h.begin(&offline,peer(20003),&[8,b'b',b'a',b'd'],b"yes",
             server(),0,0,None,now),Err(HandshakeError::InvalidPassword));
         assert_eq!(h.len(),0);
     }
