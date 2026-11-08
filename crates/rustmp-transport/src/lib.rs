@@ -25,6 +25,56 @@ pub mod legacy_id {
     pub const PONG: u8 = 37;
 }
 
+/// Packet identifiers for the RAKNET_LEGACY branch of openmultiplayer/RakNet.
+/// Unlike the original SA-MP 0.3.7 enum, the fork contains reserved slots.
+pub mod openmp_legacy_id {
+    pub const PING: u8 = 7;
+    pub const PING_OPEN_CONNECTIONS: u8 = 8;
+    pub const CONNECTION_REQUEST: u8 = 11;
+    pub const AUTH_KEY: u8 = 12;
+    pub const OPEN_CONNECTION_REQUEST: u8 = 24;
+    pub const OPEN_CONNECTION_REPLY: u8 = 25;
+    pub const CONNECTION_ATTEMPT_FAILED: u8 = 29;
+    pub const NO_FREE_INCOMING_CONNECTIONS: u8 = 31;
+    pub const PONG: u8 = 39;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyWireProfile {
+    Samp037,
+    OpenMpRakNet,
+}
+
+impl LegacyWireProfile {
+    pub fn connection_request_id(self) -> u8 {
+        match self {
+            Self::Samp037 => 8, // Alf21/samp PacketEnumerations.h
+            Self::OpenMpRakNet => openmp_legacy_id::CONNECTION_REQUEST,
+        }
+    }
+
+    fn open_reply(self) -> u8 {
+        match self {
+            Self::Samp037 => legacy_id::OPEN_CONNECTION_REPLY,
+            Self::OpenMpRakNet => openmp_legacy_id::OPEN_CONNECTION_REPLY,
+        }
+    }
+
+    fn pong(self) -> u8 {
+        match self {
+            Self::Samp037 => legacy_id::PONG,
+            Self::OpenMpRakNet => openmp_legacy_id::PONG,
+        }
+    }
+
+    fn full(self) -> u8 {
+        match self {
+            Self::Samp037 => legacy_id::NO_FREE_INCOMING_CONNECTIONS,
+            Self::OpenMpRakNet => openmp_legacy_id::NO_FREE_INCOMING_CONNECTIONS,
+        }
+    }
+}
+
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const OFFLINE_LIMIT_PER_IP_PER_SEC: u16 = 24;
 pub const DEFAULT_PENDING_PER_IP: usize = 8;
@@ -40,14 +90,28 @@ pub enum OfflineRequest {
 }
 
 pub fn decode_offline(bytes: &[u8]) -> Option<OfflineRequest> {
+    decode_offline_profiled(bytes).map(|(message, _)| message)
+}
+
+/// Detect original SA-MP vs the open.mp RakNet fork by the exact-length
+/// offline datagram. Do not interpret these messages as verified sessions.
+pub fn decode_offline_profiled(bytes: &[u8]) -> Option<(OfflineRequest, LegacyWireProfile)> {
+    use LegacyWireProfile::{OpenMpRakNet, Samp037};
     match bytes {
-        [legacy_id::OPEN_CONNECTION_REQUEST, _, _] => Some(OfflineRequest::ConnectionStart),
-        [legacy_id::PING, a, b, c, d] => Some(OfflineRequest::Ping {
+        [legacy_id::OPEN_CONNECTION_REQUEST, _, _] => Some((OfflineRequest::ConnectionStart, Samp037)),
+        [openmp_legacy_id::OPEN_CONNECTION_REQUEST, _, _] => Some((OfflineRequest::ConnectionStart, OpenMpRakNet)),
+        [legacy_id::PING, a, b, c, d] => Some((OfflineRequest::Ping {
             timestamp: [*a, *b, *c, *d], only_if_open: false,
-        }),
-        [legacy_id::PING_OPEN_CONNECTIONS, a, b, c, d] => Some(OfflineRequest::Ping {
+        }, Samp037)),
+        [openmp_legacy_id::PING, a, b, c, d] => Some((OfflineRequest::Ping {
+            timestamp: [*a, *b, *c, *d], only_if_open: false,
+        }, OpenMpRakNet)),
+        [legacy_id::PING_OPEN_CONNECTIONS, a, b, c, d] => Some((OfflineRequest::Ping {
             timestamp: [*a, *b, *c, *d], only_if_open: true,
-        }),
+        }, Samp037)),
+        [openmp_legacy_id::PING_OPEN_CONNECTIONS, a, b, c, d] => Some((OfflineRequest::Ping {
+            timestamp: [*a, *b, *c, *d], only_if_open: true,
+        }, OpenMpRakNet)),
         _ => None,
     }
 }
@@ -61,6 +125,8 @@ struct IpRate {
 #[derive(Clone, Copy, Debug)]
 struct PendingPeer {
     created: Instant,
+    profile: LegacyWireProfile,
+    saw_connection_request: bool,
 }
 
 /// Stats count messages and pre-handshake requests, **never** connected players.
@@ -71,6 +137,8 @@ pub struct OfflineStats {
     pub denied_full: u64,
     pub rate_limited: u64,
     pub expired_pending: u64,
+    /// Observed reliable connection requests; NOT accepted/authenticated peers.
+    pub reliable_requests_observed: u64,
 }
 
 /// Minimal state machine for offline probes only.
@@ -106,7 +174,7 @@ impl OfflineGateway {
     /// Unknown/truncated datagrams are silently ignored. Called after query
     /// dispatch; query and legacy RakNet use the same UDP socket.
     pub fn handle(&mut self, bytes: &[u8], peer: SocketAddr, now: Instant) -> Option<Vec<u8>> {
-        let request = decode_offline(bytes)?;
+        let (request, profile) = decode_offline_profiled(bytes)?;
         if !self.allowed(peer.ip(), now) {
             self.stats.rate_limited += 1;
             return None;
@@ -119,26 +187,67 @@ impl OfflineGateway {
                 self.stats.pings_replied += 1;
                 // The upstream server can attach offline ping data; it is
                 // deliberately empty until the exact format is ported.
-                let mut reply = vec![legacy_id::PONG];
+                let mut reply = vec![profile.pong()];
                 reply.extend_from_slice(&timestamp);
                 Some(reply)
             }
             OfflineRequest::ConnectionStart => {
-                if self.pending.contains_key(&peer) {
-                    // Retransmission: preserve original expiry, don't consume a
-                    // second slot or keep half-open peers alive forever.
-                    return Some(vec![legacy_id::OPEN_CONNECTION_REPLY, 0]);
+                if let Some(existing) = self.pending.get(&peer) {
+                    // A pending address has one wire profile. Do not switch it
+                    // during retransmissions, which could mix handshake IDs.
+                    if existing.profile != profile { return None; }
+                    // Retransmission must NOT extend original expiry.
+                    return Some(vec![profile.open_reply(), 0]);
                 }
                 if self.pending.len() >= self.max_pending
                     || self.pending.keys().filter(|addr| addr.ip() == peer.ip()).count() >= self.max_per_ip {
                     self.stats.denied_full += 1;
-                    return Some(vec![legacy_id::NO_FREE_INCOMING_CONNECTIONS, 0]);
+                    return Some(vec![profile.full(), 0]);
                 }
-                self.pending.insert(peer, PendingPeer { created: now });
+                self.pending.insert(peer, PendingPeer {
+                    created: now, profile, saw_connection_request: false,
+                });
                 self.stats.opens_replied += 1;
-                Some(vec![legacy_id::OPEN_CONNECTION_REPLY, 0])
+                Some(vec![profile.open_reply(), 0])
             }
         }
+    }
+
+    /// Inspect the *first* reliable connection-request payload sent after
+    /// a matching offline open. In legacy RakNet the request is a reliable
+    /// one-byte ID followed by an optional password. Alpha.8 records only
+    /// its presence; it NEVER answers with a fake auth challenge or admits
+    /// the sender to a gameplay/VerifiedSessions state.
+    pub fn inspect_reliable_request(
+        &mut self, bytes: &[u8], peer: SocketAddr, now: Instant,
+    ) -> Option<LegacyWireProfile> {
+        use rustmp_protocol::legacy_frame::{decode_datagram, Reliability};
+        let slot = self.pending.get_mut(&peer)?;
+        if now.saturating_duration_since(slot.created) >= HANDSHAKE_TIMEOUT
+            || slot.saw_connection_request
+        {
+            return None;
+        }
+        let packet = decode_datagram(bytes).ok()?;
+        if packet.frames.len() != 1 { return None; }
+        let frame = &packet.frames[0];
+        if frame.reliability != Reliability::Reliable
+            || frame.split.is_some()
+            || frame.ordering.is_some()
+            || frame.payload_bits % 8 != 0
+            || frame.payload.is_empty()
+            || frame.payload.len() > 256
+            || frame.payload[0] != slot.profile.connection_request_id()
+        {
+            return None;
+        }
+        slot.saw_connection_request = true;
+        self.stats.reliable_requests_observed += 1;
+        Some(slot.profile)
+    }
+
+    pub fn saw_reliable_request(&self, peer: SocketAddr) -> bool {
+        self.pending.get(&peer).is_some_and(|p| p.saw_connection_request)
     }
 
     fn allowed(&mut self, ip: IpAddr, now: Instant) -> bool {
@@ -239,6 +348,63 @@ mod tests {
         }
         assert_eq!(gateway.pending_count(), 8);
         assert_eq!(gateway.handle(&start(), peer(1242), t + Duration::from_secs(1)), Some(vec![legacy_id::NO_FREE_INCOMING_CONNECTIONS, 0]));
+    }
+
+    #[test]
+    fn profiles_use_distinct_verified_source_enum_ids() {
+        assert_eq!(legacy_id::OPEN_CONNECTION_REQUEST, 16);
+        assert_eq!(openmp_legacy_id::OPEN_CONNECTION_REQUEST, 24);
+        assert_eq!(LegacyWireProfile::Samp037.connection_request_id(), 8);
+        assert_eq!(LegacyWireProfile::OpenMpRakNet.connection_request_id(), 11);
+        let t = Instant::now();
+        let mut gateway = OfflineGateway::new(2);
+        assert_eq!(gateway.handle(&[16, 0, 0], peer(1234), t), Some(vec![17, 0]));
+        assert_eq!(gateway.handle(&[24, 0, 0], peer(5678), t), Some(vec![25, 0]));
+        assert_eq!(gateway.handle(&[24, 0, 0], peer(1234), t), None);
+        assert_eq!(gateway.handle(&[3, 1, 2, 3, 4], peer(2000), t), Some(vec![37,1,2,3,4]));
+        assert_eq!(gateway.handle(&[7, 1, 2, 3, 4], peer(2000), t), Some(vec![39,1,2,3,4]));
+    }
+
+    #[test]
+    fn reliable_request_requires_original_offline_source_and_is_not_admission() {
+        use rustmp_protocol::legacy_frame::{encode_datagram, Frame, Reliability};
+        let t = Instant::now();
+        let mut gateway = OfflineGateway::new(5);
+        let request = |id| encode_datagram(&[], &[Frame {
+            sequence: 0, reliability: Reliability::Reliable,
+            ordering: None, payload_bits: 8, payload: vec![id], split: None,
+        }]).unwrap();
+        let samp = request(8);
+        let omp = request(11);
+        assert_eq!(gateway.inspect_reliable_request(&samp, peer(1000), t), None);
+        gateway.handle(&[16,0,0], peer(1000), t);
+        gateway.handle(&[24,0,0], peer(2000), t);
+        assert_eq!(gateway.inspect_reliable_request(&omp, peer(1000), t), None);
+        assert_eq!(gateway.inspect_reliable_request(&samp, peer(1000), t),
+            Some(LegacyWireProfile::Samp037));
+        assert_eq!(gateway.inspect_reliable_request(&samp, peer(1000), t), None);
+        assert_eq!(gateway.inspect_reliable_request(&omp, peer(2000), t),
+            Some(LegacyWireProfile::OpenMpRakNet));
+        assert!(gateway.saw_reliable_request(peer(2000)));
+        assert_eq!(gateway.stats().reliable_requests_observed, 2);
+        assert_eq!(gateway.pending_count(), 2); // Never converted into authenticated players.
+        gateway.cleanup(t + HANDSHAKE_TIMEOUT);
+        assert_eq!(gateway.pending_count(), 0);
+    }
+
+    #[test]
+    fn malformed_or_non_reliable_request_never_advances_state() {
+        use rustmp_protocol::legacy_frame::{encode_datagram, Frame, Reliability};
+        let t = Instant::now();
+        let mut gateway = OfflineGateway::new(5);
+        gateway.handle(&[16,0,0], peer(1000), t);
+        assert_eq!(gateway.inspect_reliable_request(&[0xff;12], peer(1000), t), None);
+        let raw = encode_datagram(&[], &[Frame {
+            sequence: 0, reliability: Reliability::Unreliable,
+            ordering: None, payload_bits: 8, payload: vec![8], split: None,
+        }]).unwrap();
+        assert_eq!(gateway.inspect_reliable_request(&raw, peer(1000), t), None);
+        assert!(!gateway.saw_reliable_request(peer(1000)));
     }
 
     #[test]
