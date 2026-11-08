@@ -29,7 +29,7 @@ pub struct EncodedAcks {
 /// Unsigned RakNet compressed u16: one bit per zero high byte,
 /// then a one-bit nibble flag and either four or eight low bits.
 /// When the high byte is nonzero, both native little-endian bytes follow.
-fn write_compressed_u16(w: &mut BitWriter, value: u16) {
+pub(crate) fn write_compressed_u16(w: &mut BitWriter, value: u16) {
     let [low, high] = value.to_le_bytes();
     if high == 0 {
         w.write_bits(1, 1).expect("one bit fits");
@@ -46,7 +46,7 @@ fn write_compressed_u16(w: &mut BitWriter, value: u16) {
     }
 }
 
-fn read_compressed_u16(r: &mut BitReader<'_>) -> Result<u16, AckError> {
+pub(crate) fn read_compressed_u16(r: &mut BitReader<'_>) -> Result<u16, AckError> {
     let zero_high = r.read_bits(1).ok_or(AckError::Truncated)? == 1;
     if !zero_high { return r.read_u16_le().ok_or(AckError::Truncated); }
     let nibble = r.read_bits(1).ok_or(AckError::Truncated)? == 1;

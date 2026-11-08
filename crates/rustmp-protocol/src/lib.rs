@@ -5,3 +5,6 @@ pub mod bitstream;
 pub mod query;
 
 pub mod ack;
+
+/// Bounded codec for the non-split legacy RakNet datagram wire format.
+pub mod legacy_frame;
