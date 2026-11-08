@@ -177,7 +177,7 @@ impl World {
             ping: p.ping_ms,
         }).collect();
         let mut rules: Vec<(String, String)> = vec![
-            ("version".into(), "RUSTMP-0.2.0-alpha.2".into()),
+            ("version".into(), "RUSTMP-0.2.0-alpha.11".into()),
             ("mapname".into(), self.config.map.clone()),
             ("weburl".into(), self.config.website.clone()),
             ("worldtime".into(), "12:00".into()),

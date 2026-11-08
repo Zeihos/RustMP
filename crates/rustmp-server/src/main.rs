@@ -94,7 +94,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-RUSTMP server prototype 0.2.0-alpha.10 (NOT gameplay-compatible yet)\n\
+RUSTMP server prototype 0.2.0-alpha.11 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\

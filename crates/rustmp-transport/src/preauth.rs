@@ -25,6 +25,9 @@ use crate::{LegacyWireProfile, OfflineGateway};
 pub const MAX_RELIABLE_PREAUTH: usize = 128;
 pub const MAX_RETRIES_PER_POLL: usize = 16;
 pub const MAX_ACKS_PER_FRAME: usize = 64;
+/// Global cap for a single scheduler poll; prevents one tick from emitting
+/// thousands of datagrams during a connection flood.
+pub const MAX_RESEND_DATAGRAMS_PER_POLL: usize = 64;
 pub const PREAUTH_RETRY_DELAY: Duration = Duration::from_millis(300);
 pub const PREAUTH_MAX_RETRIES: u8 = 5;
 pub const PREAUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,9 +63,16 @@ pub struct ExchangeResult {
     pub duplicate_messages: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetryDatagram {
+    pub peer: SocketAddr,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RetryResult {
-    pub packets: Vec<Vec<u8>>,
+    /// Each retransmission retains its original recipient and message number.
+    pub packets: Vec<RetryDatagram>,
     /// Failed pre-auth peers whose retries have been exhausted.
     pub disconnected: Vec<SocketAddr>,
 }
@@ -184,6 +194,10 @@ impl PreAuthExchange {
         // The first reliable sequence is normally 0 in this prototype.
         // This assumption must be confirmed against actual client captures.
         state.incoming.observe(0);
+        // The offline gateway inspected reliable request #0, but did not
+        // acknowledge it. Piggyback this ACK on the first server response:
+        // otherwise a valid client keeps retransmitting its initial request.
+        state.acks.mark(0)?;
         let packet = match state.encode_outbound(&response, now) {
             Ok(packet) => packet,
             Err(err) => {
@@ -276,8 +290,10 @@ impl PreAuthExchange {
         }
         let addrs: Vec<_> = self.peers.keys().copied().collect();
         for addr in addrs {
+            if result.packets.len() >= MAX_RESEND_DATAGRAMS_PER_POLL { break; }
             let Some(state) = self.peers.get_mut(&addr) else { continue };
-            let batch = state.outgoing.poll_retries(now, MAX_RETRIES_PER_POLL);
+            let available = MAX_RESEND_DATAGRAMS_PER_POLL - result.packets.len();
+            let batch = state.outgoing.poll_retries(now, MAX_RETRIES_PER_POLL.min(available));
             if !batch.abandoned.is_empty() {
                 self.disconnect(addr);
                 result.disconnected.push(addr);
@@ -293,7 +309,7 @@ impl PreAuthExchange {
                     split: None,
                 };
                 if let Ok(bytes) = encode_datagram(&[], &[frame]) {
-                    result.packets.push(bytes);
+                    result.packets.push(RetryDatagram { peer: addr, bytes });
                 }
             }
         }
@@ -335,6 +351,43 @@ mod tests {
         let mut data=vec![incoming_id(profile),127,0,0,1];
         data.extend_from_slice(&7777u16.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn initial_connection_request_is_acknowledged_in_first_response() {
+        let now=Instant::now();
+        let addr=peer(12101);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        let packet=e.begin(&offline,addr,&[8],b"",server(),0,1,None,now).unwrap();
+        let decoded=decode_datagram(&packet).unwrap();
+        assert_eq!(decoded.acknowledgements.len(),1);
+        assert_eq!(decoded.acknowledgements[0].start,0);
+        assert_eq!(decoded.acknowledgements[0].end,0);
+        assert_eq!(decoded.frames[0].sequence,0);
+        assert_eq!(e.flush_ack(addr).unwrap(),None); // Already piggybacked.
+    }
+
+    #[test]
+    fn retries_always_include_original_destination() {
+        let now=Instant::now();
+        let mut offline=OfflineGateway::new(2);
+        let a=peer(12102);
+        let b=peer(12103);
+        open(&mut offline,a,LegacyWireProfile::Samp037,now);
+        open(&mut offline,b,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,a,&[8],b"",server(),1,1,None,now).unwrap();
+        e.begin(&offline,b,&[8],b"",server(),2,2,None,now).unwrap();
+        let batch=e.poll_retries(now+PREAUTH_RETRY_DELAY).packets;
+        assert_eq!(batch.len(),2);
+        let peers: std::collections::HashSet<_>=batch.iter().map(|d|d.peer).collect();
+        assert!(peers.contains(&a));
+        assert!(peers.contains(&b));
+        for datagram in batch {
+            assert_eq!(decode_datagram(&datagram.bytes).unwrap().frames[0].sequence,0);
+        }
     }
 
     #[test]
@@ -421,7 +474,8 @@ mod tests {
         assert!(e.poll_retries(now+PREAUTH_RETRY_DELAY/2).packets.is_empty());
         let resent=e.poll_retries(now+PREAUTH_RETRY_DELAY).packets;
         assert_eq!(resent.len(),1);
-        assert_eq!(decode_datagram(&resent[0]).unwrap().frames[0].sequence,0);
+        assert_eq!(resent[0].peer,addr);
+        assert_eq!(decode_datagram(&resent[0].bytes).unwrap().frames[0].sequence,0);
         assert_eq!(e.pending_retries(addr),Some(1));
         assert_eq!(e.poll_retries(now+PREAUTH_TIMEOUT).disconnected,vec![addr]);
         assert_eq!(e.len(),0);
