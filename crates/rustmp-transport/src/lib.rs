@@ -252,3 +252,6 @@ mod tests {
         assert_eq!(gateway.pending_count(), 0);
     }
 }
+
+/// Bookkeeping for reliable message delivery; not yet the wire protocol.
+pub mod reliability;
