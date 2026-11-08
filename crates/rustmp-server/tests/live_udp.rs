@@ -44,7 +44,11 @@ impl LocalProcess {
                 Ok((n,addr)) if addr == self.address => return buf[..n].to_vec(),
                 Ok(_) => continue,
                 Err(ref e) if e.kind() == io::ErrorKind::TimedOut
-                    || e.kind() == io::ErrorKind::WouldBlock =>
+                    || e.kind() == io::ErrorKind::WouldBlock
+                    // Windows turns an ICMP port-unreachable from a UDP
+                    // request sent *before* the child binds into WSAECONNRESET.
+                    // Treat it like a normal startup retry, not a test failure.
+                    || e.raw_os_error() == Some(10054) =>
                 {
                     thread::sleep(Duration::from_millis(20));
                 }
