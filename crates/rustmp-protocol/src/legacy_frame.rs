@@ -430,7 +430,7 @@ mod tests {
         f.split = Some(SplitInfo { id: 7, index: 0, count: MAX_SPLIT_PARTS + 1 });
         assert_eq!(encode_datagram(&[], &[f.clone()]), Err(FrameError::InvalidSplit));
         f.split = Some(SplitInfo { id: 7, index: 0, count: 2 });
-        let mut wire = encode_datagram(&[], &[f.clone()]).unwrap();
+        assert!(encode_datagram(&[], &[f.clone()]).is_ok());
         // Force count to zero when compressed (last 8 bits of header), invalid.
         // Construct malicious packet directly so the decoder is checked too.
         let mut w = BitWriter::new();
@@ -444,7 +444,7 @@ mod tests {
         crate::ack::write_compressed_u16(&mut w, 8);
         align_write(&mut w);
         w.write_u8(b'x');
-        wire = w.into_bytes();
+        let wire = w.into_bytes();
         assert_eq!(decode_datagram(&wire), Err(FrameError::InvalidSplit));
         let mut partial = frame(1, Reliability::Reliable, None, &[0xC0]);
         partial.payload_bits = 2;

@@ -418,11 +418,11 @@ mod tests {
         let mut h=HandshakeCoordinator::new();
         h.begin(&offline,peer(20002),&[11],b"",server(),0,0,
             Some(AuthPair{challenge:b"C".to_vec(),expected_response:b"R".to_vec()}),now).unwrap();
-        let confirmation=confirmation(LegacyWireProfile::OpenMpRakNet,server());
-        assert_eq!(h.receive_confirmation(peer(20002),&confirmation,now),
+        let valid_confirmation=confirmation(LegacyWireProfile::OpenMpRakNet,server());
+        assert_eq!(h.receive_confirmation(peer(20002),&valid_confirmation,now),
             Err(HandshakeError::UnexpectedState));
         h.receive_auth_response(peer(20002),b"\x0c\x01R",now).unwrap();
-        assert_eq!(h.receive_confirmation(peer(20003),&confirmation,now),
+        assert_eq!(h.receive_confirmation(peer(20003),&valid_confirmation,now),
             Err(HandshakeError::NoOfflineRequest));
         assert_eq!(h.receive_confirmation(peer(20002),
             &confirmation(LegacyWireProfile::OpenMpRakNet,peer(8888)),now),
