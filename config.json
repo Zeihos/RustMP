@@ -1,0 +1,16 @@
+{
+  "name": "open.mp Rust prototype",
+  "language": "Russian",
+  "max_players": 50,
+  "password": "",
+  "website": "open.mp",
+  "network": {
+    "bind": "0.0.0.0",
+    "port": 7777
+  },
+  "game": {
+    "mode": "Rust Core (network alpha)",
+    "map": "San Andreas"
+  },
+  "rust_text_encoding": "windows-1251"
+}
