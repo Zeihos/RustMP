@@ -255,3 +255,6 @@ mod tests {
 
 /// Bookkeeping for reliable message delivery; not yet the wire protocol.
 pub mod reliability;
+
+/// Per-session bounded legacy RakNet split-message reassembly.
+pub mod fragments;
