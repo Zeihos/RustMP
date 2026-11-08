@@ -163,6 +163,11 @@ impl OfflineGateway {
     pub fn stats(&self) -> OfflineStats { self.stats }
     pub fn pending_count(&self) -> usize { self.pending.len() }
     pub fn is_pending(&self, peer: SocketAddr) -> bool { self.pending.contains_key(&peer) }
+    pub fn pending_profile(&self, peer: SocketAddr, now: Instant) -> Option<LegacyWireProfile> {
+        let p = self.pending.get(&peer)?;
+        if now.saturating_duration_since(p.created) < HANDSHAKE_TIMEOUT { Some(p.profile) } else { None }
+    }
+
 
     /// Release a pre-connection slot after a future reliability layer accepts
     /// or rejects the client. This alone never creates a connected player.
@@ -427,3 +432,6 @@ pub mod fragments;
 
 /// Isolated per-peer verified-session coordinator (not yet live UDP admission).
 pub mod session;
+
+/// Offline-to-reliable handshake codec and gated state machine (library-only).
+pub mod handshake;
