@@ -1,5 +1,5 @@
 [package]
-name = "omp-transport"
+name = "rustmp-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

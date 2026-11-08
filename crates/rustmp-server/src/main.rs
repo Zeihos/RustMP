@@ -12,9 +12,9 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use omp_core::{Config, World};
-use omp_protocol::query::{parse_request, respond, TextEncoding};
-use omp_transport::OfflineGateway;
+use rustmp_core::{Config, World};
+use rustmp_protocol::query::{parse_request, respond, TextEncoding};
+use rustmp_transport::OfflineGateway;
 use serde_json::Value;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(20); // 50 ticks/s (prototype)
@@ -94,8 +94,8 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-open.mp Rust server prototype 0.2.0-alpha.1 (NOT gameplay-compatible yet)\n\
-Usage: cargo run --release -p omp-server -- [options]\n\
+RUSTMP server prototype 0.2.0-alpha.2 (NOT gameplay-compatible yet)\n\
+Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\
   --port PORT          UDP port (default 7777)\n\
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn query_and_legacy_handshake_share_same_udp_socket() {
-        use omp_transport::legacy_id;
+        use rustmp_transport::legacy_id;
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();

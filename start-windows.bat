@@ -7,8 +7,8 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo [INFO] Starting Rust SA-MP networking alpha. This is not yet a playable server.
-cargo run --release -p omp-server -- --config config.json
+echo [INFO] Starting RUSTMP networking alpha. This is not yet a playable server.
+cargo run --release -p rustmp-server -- --config config.json
 if errorlevel 1 (
     echo [ERROR] Server startup failed.
     pause

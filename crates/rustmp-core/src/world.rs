@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use omp_protocol::query::{QueryPlayer, QuerySnapshot, TextEncoding};
+use rustmp_protocol::query::{QueryPlayer, QuerySnapshot, TextEncoding};
 
 use crate::pool::Pool;
 
@@ -69,7 +69,7 @@ impl Default for Config {
             bind: "0.0.0.0".into(),
             port: 7777,
             max_players: 50,
-            hostname: "open.mp Rust prototype".into(),
+            hostname: "RUSTMP development server".into(),
             gamemode: "Rust Core (network alpha)".into(),
             language: "Russian".into(),
             map: "San Andreas".into(),

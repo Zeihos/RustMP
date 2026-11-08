@@ -3,7 +3,7 @@ use std::env;
 use std::error::Error;
 use std::net::UdpSocket;
 use std::time::Duration;
-use omp_transport::legacy_id;
+use rustmp_transport::legacy_id;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let target = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7777".into());

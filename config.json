@@ -1,15 +1,15 @@
 {
-  "name": "open.mp Rust prototype",
+  "name": "RUSTMP | Development Server",
   "language": "Russian",
   "max_players": 50,
   "password": "",
-  "website": "open.mp",
+  "website": "",
   "network": {
     "bind": "0.0.0.0",
     "port": 7777
   },
   "game": {
-    "mode": "Rust Core (network alpha)",
+    "mode": "RUSTMP Network Alpha",
     "map": "San Andreas"
   },
   "rust_text_encoding": "windows-1251"

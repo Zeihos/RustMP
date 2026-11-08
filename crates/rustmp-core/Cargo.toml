@@ -1,9 +1,9 @@
 [package]
-name = "omp-core"
+name = "rustmp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Core world state and reusable entity pools for a Rust open.mp port"
 
 [dependencies]
-omp-protocol = { path = "../omp-protocol" }
+rustmp-protocol = { path = "../rustmp-protocol" }
