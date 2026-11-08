@@ -1,0 +1,12 @@
+[package]
+name = "omp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone SA-MP offline RakNet and query Rust server prototype (not a playable server yet)"
+
+[dependencies]
+omp-core = { path = "../omp-core" }
+omp-protocol = { path = "../omp-protocol" }
+omp-transport = { path = "../omp-transport" }
+serde_json = "1"

@@ -1,0 +1,8 @@
+[package]
+name = "omp-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Legacy SA-MP RakNet offline transport bootstrap (not an established game connection)"
+
+[dependencies]
