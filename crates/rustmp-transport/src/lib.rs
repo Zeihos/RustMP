@@ -435,3 +435,6 @@ pub mod session;
 
 /// Offline-to-reliable handshake codec and gated state machine (library-only).
 pub mod handshake;
+
+/// Bounded reliable handshake exchange, library-only pending client capture.
+pub mod preauth;
