@@ -3,6 +3,7 @@
 //! Wire-format parsing must be verified with actual legacy client traffic.
 
 use std::collections::{BTreeMap, BTreeSet};
+use rustmp_protocol::ack::{decode_ack_prefix, AckError};
 use std::time::{Duration, Instant};
 
 pub const MAX_IN_FLIGHT: usize = 512;
@@ -66,6 +67,21 @@ impl OutboundReliability {
     }
 
     pub fn pending_count(&self) -> usize { self.outstanding.len() }
+
+    /// Apply a validated legacy RakNet ACK prefix to the resend queue.
+    /// Only for packets from an authenticated reliable peer: the caller
+    /// must enforce session identity and packet integrity first.
+    /// This is NOT wired to the live UDP server yet.
+    pub fn apply_ack_prefix(&mut self, bytes: &[u8]) -> Result<(usize, usize), AckError> {
+        let decoded = decode_ack_prefix(bytes)?;
+        let mut acknowledged = 0;
+        for range in decoded.ranges {
+            for message in range.start..=range.end {
+                if self.acknowledge(message) { acknowledged += 1; }
+            }
+        }
+        Ok((acknowledged, decoded.bits_consumed))
+    }
 
     pub fn track_sent(&mut self, data: &[u8], now: Instant) -> Result<u16, ReliabilityError> {
         if data.is_empty() { return Err(ReliabilityError::EmptyMessage); }
@@ -335,4 +351,18 @@ mod tests {
         assert!(d.push(0, 0, vec![2]).unwrap().is_empty());
         assert_eq!(d.push(0, u16::MAX, vec![1]).unwrap(), vec![vec![1], vec![2]]);
     }
+
+    #[test]
+    fn verified_ack_prefix_releases_only_tracked_messages() {
+        let t = Instant::now();
+        let mut tx = OutboundReliability::new(Duration::from_millis(200), 3);
+        for _ in 0..6 { tx.track_sent(b"payload", t).unwrap(); }
+        let wire = rustmp_protocol::ack::encode_ack_prefix(&[1, 2, 3, 3, 99]).unwrap();
+        assert_eq!(tx.apply_ack_prefix(&wire.bytes), Ok((3, wire.bit_len)));
+        assert_eq!(tx.pending_count(), 3);
+        assert_eq!(tx.apply_ack_prefix(&wire.bytes), Ok((0, wire.bit_len)));
+        assert_eq!(tx.apply_ack_prefix(&[]), Err(AckError::Truncated));
+        assert_eq!(tx.pending_count(), 3);
+    }
+
 }

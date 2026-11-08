@@ -6,3 +6,4 @@ license.workspace = true
 description = "Legacy SA-MP RakNet offline transport bootstrap (not an established game connection)"
 
 [dependencies]
+rustmp-protocol = { path = "../rustmp-protocol" }
