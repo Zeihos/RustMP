@@ -228,6 +228,15 @@ impl PreAuthExchange {
         {
             return Err(PreAuthError::UnexpectedFrame);
         }
+        // Validate impossible future sequences *before* accepting ACKs.
+        // Otherwise a packet with a fake ACK and an invalid frame could
+        // acknowledge our unconfirmed handshake response before failing.
+        for frame in &packet.frames {
+            let ahead = frame.sequence.wrapping_sub(state.incoming.next_expected());
+            if ahead < 0x8000 && usize::from(ahead) >= crate::reliability::RECEIVE_WINDOW {
+                return Err(PreAuthError::Reliability(ReliabilityError::TooFarAhead));
+            }
+        }
         let mut result = ExchangeResult::default();
         let state = self.peers.get_mut(&peer).ok_or(PreAuthError::UnknownPeer)?;
         for range in packet.acknowledgements {
@@ -479,6 +488,44 @@ mod tests {
         assert_eq!(e.pending_retries(addr),Some(1));
         assert_eq!(e.poll_retries(now+PREAUTH_TIMEOUT).disconnected,vec![addr]);
         assert_eq!(e.len(),0);
+    }
+
+    #[test]
+    fn invalid_future_sequence_does_not_acknowledge_outgoing_response() {
+        let now=Instant::now();
+        let addr=peer(12201);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        assert_eq!(e.pending_retries(addr),Some(1));
+        let adversarial=packet(900,&[26,127,0,0,1,0x61,0x1e],&[0]);
+        assert_eq!(e.ingest(addr,&adversarial,now),
+            Err(PreAuthError::Reliability(ReliabilityError::TooFarAhead)));
+        assert_eq!(e.pending_retries(addr),Some(1)); // ACK had NO effect.
+        assert_eq!(e.phase(addr),Some(HandshakePhase::AwaitClientConfirmation));
+        assert!(e.ingest(addr,&packet(1,&confirm(LegacyWireProfile::Samp037),&[0]),now)
+            .unwrap().transport_confirmed);
+    }
+
+    #[test]
+    fn duplicate_initial_request_reacknowledged_without_restarting_handshake() {
+        let now=Instant::now();
+        let addr=peer(12202);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        let first=e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        let duplicate=e.ingest(addr,&packet(0,&[8],&[]),now).unwrap();
+        assert_eq!(duplicate.duplicate_messages,1);
+        assert!(duplicate.outgoing.is_empty());
+        assert_eq!(e.pending_retries(addr),Some(1));
+        let ack=e.flush_ack(addr).unwrap().unwrap();
+        assert_eq!(decode_datagram(&ack).unwrap().acknowledgements[0].start,0);
+        let retry=e.poll_retries(now+PREAUTH_RETRY_DELAY).packets;
+        assert_eq!(retry.len(),1);
+        assert_eq!(decode_datagram(&retry[0].bytes).unwrap().frames[0].payload,
+            decode_datagram(&first).unwrap().frames[0].payload);
     }
 
     #[test]

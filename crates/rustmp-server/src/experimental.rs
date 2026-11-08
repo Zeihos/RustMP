@@ -50,9 +50,10 @@ impl ExperimentalPreAuth {
     pub fn stats(&self) -> ProbeStats { self.stats }
 
     /// Intercept open.mp fork's three-byte offline open before OfflineGateway
-    /// can allocate any pending slot. The cookie is bound to IPv4 address and
-    /// valid across source-port changes, mirroring the legacy fork's wire
-    /// exchange. This is a localhost diagnostic, NOT a cryptographic login.
+    /// can allocate any pending slot. This diagnostic token is bound to
+    /// the *whole* SocketAddr and may be redeemed once before expiry.
+    /// This strengthens replay checks but intentionally differs from the
+    /// upstream fork's per-IPv4 cookie. It is NOT cryptographic login.
     ///
     /// Ok(()) lets the normal offline gateway process the packet.
     /// Err(bytes) means it was consumed; empty bytes indicate silent denial.
@@ -73,7 +74,7 @@ impl ExperimentalPreAuth {
             self.stats.rejected += 1;
             return Err(Vec::new());
         }
-        match self.cookie.check(peer, bytes) {
+        match self.cookie.check(peer, bytes, now) {
             Some(CookieVerdict::Challenge(bytes)) => {
                 self.stats.cookie_challenges += 1;
                 Err(bytes.to_vec())
@@ -81,6 +82,10 @@ impl ExperimentalPreAuth {
             Some(CookieVerdict::Valid(_)) => {
                 self.stats.cookie_validations += 1;
                 Ok(())
+            }
+            Some(CookieVerdict::Rejected) => {
+                self.stats.rejected += 1;
+                Err(Vec::new())
             }
             None => Err(Vec::new()),
         }
@@ -137,10 +142,19 @@ impl ExperimentalPreAuth {
                     }
                     return result.outgoing;
                 }
-                Err(_) => {
-                    self.exchange.disconnect(peer);
-                    offline.release_pending(peer);
+                Err(err) => {
                     self.stats.rejected += 1;
+                    // A corrupted or out-of-window datagram must not tear
+                    // down an otherwise valid in-flight handshake. The
+                    // pre-auth codec rejects these before accepting ACKs.
+                    if !matches!(err,
+                        rustmp_transport::preauth::PreAuthError::Malformed(_)
+                        | rustmp_transport::preauth::PreAuthError::UnexpectedFrame
+                        | rustmp_transport::preauth::PreAuthError::Reliability(_))
+                    {
+                        self.exchange.disconnect(peer);
+                        offline.release_pending(peer);
+                    }
                     return Vec::new();
                 }
             }
@@ -198,6 +212,7 @@ impl ExperimentalPreAuth {
 
     pub fn cleanup(&mut self, now: Instant) {
         self.exchange.cleanup(now);
+        self.cookie.cleanup(now);
         self.rates.retain(|_,rate| now.saturating_duration_since(rate.start) < Duration::from_secs(2));
     }
 }
@@ -261,13 +276,60 @@ mod tests {
         assert_eq!(router.stats().cookie_challenges,1);
         assert_eq!(router.stats().cookie_validations,1);
 
-        let samp=router.cookie.encode_request(client,CookieFlavor::OriginalSamp).unwrap();
-        assert_eq!(router.check_cookie(&samp,client,now,&gateway),Ok(()));
+        let replay=router.cookie.encode_request(client,CookieFlavor::OriginalSamp).unwrap();
+        assert!(router.check_cookie(&replay,client,now,&gateway).is_err());
+        // A fresh port must first receive its OWN cookie challenge.
+        let second=peer(52011);
+        let challenge=router.check_cookie(&[24,0,0],second,now,&gateway).unwrap_err();
+        assert_eq!(challenge.len(),3);
+        let samp=router.cookie.encode_request(second,CookieFlavor::OriginalSamp).unwrap();
+        assert_eq!(router.check_cookie(&samp,second,now,&gateway),Ok(()));
         assert_eq!(router.handle(&packet(0,&[11],&[]),client,peer(7777),
             &mut gateway,b"",now),Vec::<Vec<u8>>::new());
         assert_eq!(router.pending_count(),0); // open.mp game auth still disabled
     }
 
+
+    #[test]
+    fn replay_after_success_cannot_reopen_offline_slot() {
+        let now=Instant::now();
+        let sender=peer(52120);
+        let mut gateway=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let challenge=router.check_cookie(&[24,0,0],sender,now,&gateway).unwrap_err();
+        let cookie=u16::from_le_bytes([challenge[1],challenge[2]]);
+        let [lo,hi]=(cookie ^ 0x6d70).to_le_bytes();
+        assert_eq!(router.check_cookie(&[24,lo,hi],sender,now,&gateway),Ok(()));
+        assert_eq!(gateway.handle(&[24,lo,hi],sender,now),Some(vec![25,0]));
+        assert!(router.check_cookie(&[24,lo,hi],sender,now,&gateway).is_err());
+        assert_eq!(router.stats().cookie_validations,1);
+        assert_eq!(gateway.pending_count(),1);
+        let other_port=peer(52121);
+        // The copied response is NOT valid for another source port.
+        let answer=router.check_cookie(&[24,lo,hi],other_port,now,&gateway).unwrap_err();
+        assert_eq!(answer[0],26);
+        assert_eq!(gateway.pending_count(),1);
+    }
+
+    #[test]
+    fn consumed_cookie_tombstone_expires_and_frees_memory() {
+        use rustmp_transport::cookie::COOKIE_TTL;
+        let now=Instant::now();
+        let sender=peer(52130);
+        let mut gateway=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        router.check_cookie(&[24,0,0],sender,now,&gateway).unwrap_err();
+        let retry=router.cookie.encode_request(sender,rustmp_transport::cookie::CookieFlavor::OpenMp)
+            .unwrap();
+        assert_eq!(router.check_cookie(&retry,sender,now,&gateway),Ok(()));
+        assert!(router.check_cookie(&retry,sender,now,&gateway).is_err());
+        assert_eq!(router.cookie.pending_count(),1);
+        router.cleanup(now+COOKIE_TTL);
+        assert_eq!(router.cookie.pending_count(),0);
+        let challenge=router.check_cookie(&retry,sender,now+COOKIE_TTL,&gateway).unwrap_err();
+        assert_eq!(challenge.len(),3);
+        assert_eq!(challenge[0],26);
+    }
     #[test]
     fn openmp_and_untrusted_peers_never_get_fake_handshake_response() {
         let now=Instant::now();
@@ -308,6 +370,32 @@ mod tests {
         assert!(router.allowed(peer(20000),now+Duration::from_secs(1)));
     }
 
+
+    #[test]
+    fn damaged_datagram_does_not_cancel_valid_local_handshake() {
+        let now=Instant::now();
+        let sender=peer(52200);
+        let mut gateway=OfflineGateway::new(5);
+        gateway.handle(&[16,0,0],sender,now);
+        let mut router=ExperimentalPreAuth::new();
+        let accepted=router.handle(&packet(0,&[8],&[]),sender,peer(7777),
+            &mut gateway,b"",now);
+        assert_eq!(accepted.len(),1);
+        assert_eq!(router.pending_count(),1);
+        // Invalid frame + an ACK for our first response must not cancel
+        // the session or release our retry state.
+        let bad=packet(900,&[26,127,0,0,1,0x61,0x1e],&[0]);
+        assert!(router.handle(&bad,sender,peer(7777),&mut gateway,b"",now).is_empty());
+        assert_eq!(router.pending_count(),1);
+        assert_eq!(gateway.pending_count(),1);
+        assert_eq!(router.poll_retries(now+Duration::from_millis(300)).packets.len(),1);
+
+        let good=router.handle(&packet(1,&[26,127,0,0,1,0x61,0x1e],&[0]),
+            sender,peer(7777),&mut gateway,b"",now);
+        assert_eq!(good.len(),1);
+        assert_eq!(router.pending_count(),0);
+        assert_eq!(router.stats().transport_confirmations,1);
+    }
     #[test]
     fn retry_packets_preserve_destination_for_udp_send_to() {
         let now=Instant::now();

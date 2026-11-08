@@ -97,7 +97,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-RUSTMP server prototype 0.2.0-alpha.12 (NOT gameplay-compatible yet)\n\
+RUSTMP server prototype 0.2.0-alpha.13 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\
@@ -519,6 +519,22 @@ mod tests {
         assert_eq!(router.stats().cookie_challenges,1);
         assert_eq!(router.stats().cookie_validations,1);
 
+        // Consumed cookies MUST NOT produce another open reply or any
+        // additional offline peer allocation.
+        let replay=dispatch_datagram(&[24,lo,hi],peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),server);
+        assert!(replay.is_empty());
+        assert_eq!(offline.pending_count(),1);
+        assert_eq!(router.stats().cookie_validations,1);
+
+        // This previously could be redeemed with a different UDP port.
+        let other:SocketAddr="127.0.0.1:54001".parse().unwrap();
+        let copied=dispatch_datagram(&[24,lo,hi],other,now,&world,
+            &mut limits,&mut offline,Some(&mut router),server);
+        assert_eq!(copied.len(),1);
+        assert_eq!(copied[0][0],26);
+        assert_eq!(offline.pending_count(),1);
+
         // No authentic open.mp auth table is installed, so we never issue
         // a fabricated reliable challenge, and never admit a game player.
         use rustmp_protocol::legacy_frame::{encode_datagram,Frame,Reliability};
@@ -530,6 +546,46 @@ mod tests {
             &mut limits,&mut offline,Some(&mut router),server);
         assert!(replies.is_empty());
         assert_eq!(router.pending_count(),0);
+        assert!(world.query_snapshot().players.is_empty());
+    }
+
+
+    #[test]
+    fn openmp_cookie_exchange_works_on_real_loopback_udp_sockets() {
+        let server=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let bound=server.local_addr().unwrap();
+        let world=World::new(Config::default());
+        let now=Instant::now();
+        let mut limits=HashMap::new();
+        let mut offline=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let mut buf=[0u8;256];
+
+        client.send_to(&[24,0,0],bound).unwrap();
+        let (n,remote)=server.recv_from(&mut buf).unwrap();
+        let replies=dispatch_datagram(&buf[..n],remote,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(replies.len(),1);
+        assert_eq!(offline.pending_count(),0); // No allocation before cookie.
+        server.send_to(&replies[0],remote).unwrap();
+        let (n,_)=client.recv_from(&mut buf).unwrap();
+        assert_eq!(n,3);
+        assert_eq!(buf[0],26);
+        let token=u16::from_le_bytes([buf[1],buf[2]]);
+        let [lo,hi]=(token ^ 0x6D70).to_le_bytes();
+
+        client.send_to(&[24,lo,hi],bound).unwrap();
+        let (n,remote)=server.recv_from(&mut buf).unwrap();
+        let replies=dispatch_datagram(&buf[..n],remote,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(replies,vec![vec![25,0]]);
+        server.send_to(&replies[0],remote).unwrap();
+        let (n,_)=client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n],&[25,0]);
+        assert_eq!(offline.pending_count(),1);
         assert!(world.query_snapshot().players.is_empty());
     }
 

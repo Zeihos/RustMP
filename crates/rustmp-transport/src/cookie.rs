@@ -1,27 +1,31 @@
-//! Legacy open.mp offline cookie wire exchange.
+//! Bounded one-time legacy open.mp cookie challenge for LOCAL LOOPBACK TESTS.
 //!
-//! Reference: openmultiplayer/RakNet, SAMPRakNet.cpp OnConnectionRequest,
-//! SAMPRakNet.hpp markers, PacketEnumerations.h RAKNET_LEGACY.
+//! Source for wire IDs, XOR markers and 3-byte shape:
+//! openmultiplayer/RakNet SAMPRakNet.cpp / SAMPRakNet.hpp.
 //!
-//! Cookie replies are three bytes: ID_OPEN_CONNECTION_COOKIE (26), then
-//! little-endian u16 cookie. A client retries ID_OPEN_CONNECTION_REQUEST (24)
-//! with the cookie XORed with its protocol marker (0x6969 or 0x6D70).
+//! The reference fork derives the cookie from the IPv4 address. This local
+//! diagnostic strengthens replay isolation by tying *pending* cookie state
+//! to the complete source SocketAddr, consuming each challenge once and
+//! expiring it quickly. This stronger stateful behavior is not claimed to
+//! match every real client retransmission and must be tested against traces.
 //!
-//! This implementation is deliberately limited to the opt-in LOOPBACK
-//! diagnostic. 16-bit cookies are a weak off-path check, NOT authentication,
-//! encryption, or proof of client identity. The standard-library RandomState
-//! seeds this process-local table, but its hash is not a cryptographic MAC.
-//! Do not enable this gate for untrusted public traffic.
+//! Only 16 bits are on the wire. RandomState is not a cryptographic MAC.
+//! This must NEVER be exposed as game authentication or a public-facing gate.
 
-use std::collections::hash_map::RandomState;
+use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 pub const ID_OPEN_CONNECTION_REQUEST: u8 = 24;
 pub const ID_OPEN_CONNECTION_REPLY: u8 = 25;
 pub const ID_OPEN_CONNECTION_COOKIE: u8 = 26;
 pub const SAMP_COOKIE_XOR: u16 = 0x6969;
 pub const OMP_COOKIE_XOR: u16 = 0x6D70;
+
+pub const COOKIE_TTL: Duration = Duration::from_secs(4);
+pub const MAX_COOKIE_SLOTS: usize = 128;
+pub const MAX_COOKIE_SLOTS_PER_IP: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CookieFlavor { OriginalSamp, OpenMp }
@@ -30,10 +34,22 @@ pub enum CookieFlavor { OriginalSamp, OpenMp }
 pub enum CookieVerdict {
     Challenge([u8; 3]),
     Valid(CookieFlavor),
+    /// Already consumed or resource-limited. No datagram should be sent.
+    Rejected,
 }
 
+#[derive(Clone, Copy)]
+struct PendingCookie {
+    created: Instant,
+    value: u16,
+    consumed: bool,
+}
+
+/// Fixed-size, per-endpoint cookie state. No session or player is admitted.
 pub struct CookieGate {
     state: RandomState,
+    nonce: u64,
+    pending: HashMap<SocketAddr, PendingCookie>,
 }
 
 impl Default for CookieGate {
@@ -41,50 +57,87 @@ impl Default for CookieGate {
 }
 
 impl CookieGate {
-    pub fn new() -> Self { Self { state: RandomState::new() } }
+    pub fn new() -> Self {
+        Self { state: RandomState::new(), nonce: 0, pending: HashMap::new() }
+    }
+    pub fn pending_count(&self) -> usize { self.pending.len() }
 
-    /// Deterministic per-IP token for the lifetime of this gate, regardless
-    /// of the client's UDP source port. Does not grant a session on its own.
-    pub fn cookie_for(&self, ip: Ipv4Addr) -> u16 {
+    /// Clear both expired challenges and consumed replay tombstones.
+    /// Bad traffic never extends a challenge's original lifetime.
+    pub fn cleanup(&mut self, now: Instant) -> usize {
+        let before = self.pending.len();
+        self.pending.retain(|_, challenge| {
+            now.saturating_duration_since(challenge.created) < COOKIE_TTL
+        });
+        before - self.pending.len()
+    }
+
+    fn next_cookie(&mut self, peer: SocketAddr) -> u16 {
+        self.nonce = self.nonce.wrapping_add(1);
         let mut h = self.state.build_hasher();
-        "RUSTMP local cookie probe".hash(&mut h);
-        ip.hash(&mut h);
+        "RUSTMP loopback one-time cookie".hash(&mut h);
+        peer.hash(&mut h);
+        self.nonce.hash(&mut h);
         let n = h.finish();
         let mut cookie = ((n >> 48) ^ (n >> 32) ^ (n >> 16) ^ n) as u16;
-        // Keep the common all-zero offline request from *accidentally*
-        // satisfying either recognized marker after a rare collision.
-        if cookie == OMP_COOKIE_XOR || cookie == SAMP_COOKIE_XOR {
+        // Prevent zero-filled requests being mistaken for a client response.
+        while cookie == OMP_COOKIE_XOR || cookie == SAMP_COOKIE_XOR {
             cookie = cookie.wrapping_add(1);
         }
         cookie
     }
 
-    pub fn check(
-        &self, peer: SocketAddr, request: &[u8],
-    ) -> Option<CookieVerdict> {
-        if request.len() != 3 || request[0] != ID_OPEN_CONNECTION_REQUEST {
+    /// Validate an exact three-byte open request or challenge the peer.
+    /// A complete endpoint may redeem a token once, while it is unexpired.
+    /// A replay from another source port cannot redeem that token.
+    pub fn check(&mut self, peer: SocketAddr, request: &[u8], now: Instant)
+        -> Option<CookieVerdict>
+    {
+        if request.len() != 3 || request[0] != ID_OPEN_CONNECTION_REQUEST
+            || !peer.is_ipv4()
+        {
             return None;
         }
-        let IpAddr::V4(ip) = peer.ip() else { return None };
-        let cookie = self.cookie_for(ip);
-        let received = u16::from_le_bytes([request[1], request[2]]);
-        if received ^ OMP_COOKIE_XOR == cookie {
-            return Some(CookieVerdict::Valid(CookieFlavor::OpenMp));
+        self.cleanup(now);
+        if let Some(challenge) = self.pending.get_mut(&peer) {
+            if challenge.consumed {
+                return Some(CookieVerdict::Rejected);
+            }
+            let received = u16::from_le_bytes([request[1], request[2]]);
+            if received ^ OMP_COOKIE_XOR == challenge.value {
+                challenge.consumed = true;
+                return Some(CookieVerdict::Valid(CookieFlavor::OpenMp));
+            }
+            if received ^ SAMP_COOKIE_XOR == challenge.value {
+                challenge.consumed = true;
+                return Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp));
+            }
+            let [lo, hi] = challenge.value.to_le_bytes();
+            return Some(CookieVerdict::Challenge([ID_OPEN_CONNECTION_COOKIE, lo, hi]));
         }
-        if received ^ SAMP_COOKIE_XOR == cookie {
-            return Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp));
+        if self.pending.len() >= MAX_COOKIE_SLOTS
+            || self.pending.keys().filter(|p| p.ip() == peer.ip()).count()
+                >= MAX_COOKIE_SLOTS_PER_IP
+        {
+            return Some(CookieVerdict::Rejected);
         }
-        let [lo, hi] = cookie.to_le_bytes();
+        let value = self.next_cookie(peer);
+        self.pending.insert(peer, PendingCookie { created: now, value, consumed: false });
+        let [lo, hi] = value.to_le_bytes();
         Some(CookieVerdict::Challenge([ID_OPEN_CONNECTION_COOKIE, lo, hi]))
     }
 
-    pub fn encode_request(&self, peer: SocketAddr, flavor: CookieFlavor) -> Option<[u8; 3]> {
-        let IpAddr::V4(ip) = peer.ip() else { return None };
+    /// Helper for constructing the *client* retry packet in tests.
+    /// Does not consume server-side state.
+    pub fn encode_request(&self, peer: SocketAddr, flavor: CookieFlavor)
+        -> Option<[u8; 3]>
+    {
+        let token = self.pending.get(&peer)?.value;
         let marker = match flavor {
             CookieFlavor::OriginalSamp => SAMP_COOKIE_XOR,
             CookieFlavor::OpenMp => OMP_COOKIE_XOR,
         };
-        let [lo,hi] = (self.cookie_for(ip) ^ marker).to_le_bytes();
+        let [lo, hi] = (token ^ marker).to_le_bytes();
         Some([ID_OPEN_CONNECTION_REQUEST, lo, hi])
     }
 }
@@ -93,62 +146,114 @@ impl CookieGate {
 mod tests {
     use super::*;
 
-    fn peer(port:u16)->SocketAddr {
-        SocketAddr::from(([127,0,0,1],port))
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([127,0,0,1], port))
     }
-
-    #[test]
-    fn challenge_then_valid_openmp_retry() {
-        let gate=CookieGate::new();
-        let client=peer(9000);
-        let challenge=gate.check(client,&[24,0,0]).unwrap();
-        let CookieVerdict::Challenge(bytes)=challenge else { panic!("expected challenge") };
-        assert_eq!(bytes[0],26);
-        assert_eq!(u16::from_le_bytes([bytes[1],bytes[2]]),
-            gate.cookie_for(Ipv4Addr::LOCALHOST));
-        let xored=u16::from_le_bytes([bytes[1],bytes[2]]) ^ OMP_COOKIE_XOR;
-        let [lo,hi]=xored.to_le_bytes();
-        assert_eq!(gate.check(client,&[24,lo,hi]),
-            Some(CookieVerdict::Valid(CookieFlavor::OpenMp)));
-    }
-
-    #[test]
-    fn original_samp_marker_is_supported_on_openmp_fork() {
-        let gate=CookieGate::new();
-        let p=peer(32000);
-        let retry=gate.encode_request(p,CookieFlavor::OriginalSamp).unwrap();
-        assert_eq!(gate.check(p,&retry),
-            Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp)));
-        // The cookie is IP-bound, not per UDP port.
-        assert_eq!(gate.check(peer(32001),&retry),
-            Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp)));
-    }
-
-    #[test]
-    fn malformed_and_wrong_tokens_never_pass() {
-        let gate=CookieGate::new();
-        let p=peer(1);
-        assert_eq!(gate.check(p,&[]),None);
-        assert_eq!(gate.check(p,&[24]),None);
-        assert_eq!(gate.check(p,&[24,0,0,0]),None);
-        assert_eq!(gate.check(p,&[16,0,0]),None);
-        assert_eq!(gate.check("[::1]:9999".parse().unwrap(),&[24,0,0]),None);
-        let valid=gate.encode_request(p,CookieFlavor::OpenMp).unwrap();
-        let mut wrong=valid;
-        wrong[1]^=0xff;
-        wrong[2]^=0xff;
-        assert!(matches!(gate.check(p,&wrong),Some(CookieVerdict::Challenge(_))));
-        assert!(matches!(gate.check(p,&[24,0,0]),Some(CookieVerdict::Challenge(_))));
-    }
-
-    #[test]
-    fn no_peer_state_or_external_secrets_in_wire_values() {
-        let gate=CookieGate::new();
-        let p=peer(7777);
-        for _ in 0..100 {
-            assert!(matches!(gate.check(p,&[24,0,0]),Some(CookieVerdict::Challenge(_))));
+    fn start(gate: &mut CookieGate, p: SocketAddr, now: Instant) -> [u8; 3] {
+        match gate.check(p, &[24,0,0], now) {
+            Some(CookieVerdict::Challenge(challenge)) => challenge,
+            other => panic!("expected challenge, received {other:?}"),
         }
-        // No per-packet heap state and no auth table is stored by this gate.
-        assert_eq!(gate.encode_request(p,CookieFlavor::OpenMp).unwrap()[0],24);
+    }
+
+    #[test]
+    fn challenge_then_one_time_openmp_retry() {
+        let now = Instant::now();
+        let mut gate = CookieGate::new();
+        let p = peer(9000);
+        let challenge = start(&mut gate, p, now);
+        assert_eq!(challenge[0], ID_OPEN_CONNECTION_COOKIE);
+        let retry = gate.encode_request(p, CookieFlavor::OpenMp).unwrap();
+        assert_eq!(gate.check(p,&retry,now),
+            Some(CookieVerdict::Valid(CookieFlavor::OpenMp)));
+        assert_eq!(gate.check(p,&retry,now),
+            Some(CookieVerdict::Rejected));
+        assert_eq!(gate.pending_count(),1); // consumed tombstone, no re-admission
+    }
+
+    #[test]
+    fn challenge_is_bound_to_udp_endpoint_and_cannot_be_replayed_to_other_port() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        let a=peer(32000);
+        let b=peer(32001);
+        start(&mut gate,a,now);
+        let retry=gate.encode_request(a,CookieFlavor::OriginalSamp).unwrap();
+        assert!(matches!(gate.check(b,&retry,now),Some(CookieVerdict::Challenge(_))));
+        assert_eq!(gate.check(a,&retry,now),
+            Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp)));
+        assert_eq!(gate.check(a,&retry,now),
+            Some(CookieVerdict::Rejected));
+    }
+
+    #[test]
+    fn wrong_cookie_does_not_reset_expiry() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        let p=peer(32002);
+        let first=start(&mut gate,p,now);
+        assert_eq!(gate.check(p,&[24,0,0],now+COOKIE_TTL/2),
+            Some(CookieVerdict::Challenge(first)));
+        assert_eq!(gate.cleanup(now+COOKIE_TTL),1);
+        assert_eq!(gate.pending_count(),0);
+        // Stale response never validates: without a new outstanding challenge,
+        // the gate issues a fresh challenge, regardless of supplied bytes.
+        let old=gate.encode_request(p,CookieFlavor::OpenMp);
+        assert_eq!(old,None);
+        assert!(matches!(gate.check(p,&[24,0,0],now+COOKIE_TTL),
+            Some(CookieVerdict::Challenge(_))));
+    }
+
+    #[test]
+    fn malformed_headers_and_ipv6_never_allocate() {
+        let mut gate=CookieGate::new();
+        let now=Instant::now();
+        assert_eq!(gate.check(peer(1),&[],now),None);
+        assert_eq!(gate.check(peer(1),&[24],now),None);
+        assert_eq!(gate.check(peer(1),&[24,0,0,0],now),None);
+        assert_eq!(gate.check(peer(1),&[16,0,0],now),None);
+        assert_eq!(gate.check("[::1]:9000".parse().unwrap(),&[24,0,0],now),None);
+        assert_eq!(gate.pending_count(),0);
+    }
+
+    #[test]
+    fn per_ip_capacity_is_bounded_and_recovers_after_expiration() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        for port in 10000..10000+MAX_COOKIE_SLOTS_PER_IP as u16 {
+            start(&mut gate,peer(port),now);
+        }
+        assert_eq!(gate.pending_count(),MAX_COOKIE_SLOTS_PER_IP);
+        assert_eq!(gate.check(peer(20000),&[24,0,0],now),
+            Some(CookieVerdict::Rejected));
+        assert_eq!(gate.cleanup(now+COOKIE_TTL),MAX_COOKIE_SLOTS_PER_IP);
+        assert!(matches!(gate.check(peer(20000),&[24,0,0],now+COOKIE_TTL),
+            Some(CookieVerdict::Challenge(_))));
+    }
+
+    #[test]
+    fn global_capacity_limited_across_different_ipv4_addresses() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        for idx in 0..MAX_COOKIE_SLOTS {
+            let a=SocketAddr::from(([127,0,(idx/256) as u8,(idx%256) as u8],30000));
+            assert!(matches!(gate.check(a,&[24,0,0],now),Some(CookieVerdict::Challenge(_))));
+        }
+        assert_eq!(gate.pending_count(),MAX_COOKIE_SLOTS);
+        let extra=SocketAddr::from(([127,1,1,1],30000));
+        assert_eq!(gate.check(extra,&[24,0,0],now),Some(CookieVerdict::Rejected));
+        assert_eq!(gate.cleanup(now+COOKIE_TTL),MAX_COOKIE_SLOTS);
+    }
+
+    #[test]
+    fn repeat_wrong_cookie_retains_single_challenge_without_memory_growth() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        let p=peer(7777);
+        let initial=start(&mut gate,p,now);
+        for _ in 0..100 {
+            assert_eq!(gate.check(p,&[24,0,0],now),Some(CookieVerdict::Challenge(initial)));
+        }
+        assert_eq!(gate.pending_count(),1);
     }
 }
