@@ -258,3 +258,6 @@ pub mod reliability;
 
 /// Per-session bounded legacy RakNet split-message reassembly.
 pub mod fragments;
+
+/// Isolated per-peer verified-session coordinator (not yet live UDP admission).
+pub mod session;
