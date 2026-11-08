@@ -7,11 +7,11 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-echo [CHECK] cargo check --workspace --all-targets
-cargo check --workspace --all-targets
+echo [CHECK] cargo check --locked --workspace --all-targets
+cargo check --locked --workspace --all-targets
 if errorlevel 1 goto failed
-echo [TEST] cargo test --workspace
-cargo test --workspace
+echo [TEST] cargo test --locked --workspace
+cargo test --locked --workspace
 if errorlevel 1 goto failed
 echo [OK] Workspace checks and tests passed.
 pause

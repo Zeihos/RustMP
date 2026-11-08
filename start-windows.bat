@@ -8,7 +8,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo [INFO] Starting RUSTMP networking alpha. This is not yet a playable server.
-cargo run --release -p rustmp-server -- --config config.json
+cargo run --locked --release -p rustmp-server -- --config config.json
 if errorlevel 1 (
     echo [ERROR] Server startup failed.
     pause
