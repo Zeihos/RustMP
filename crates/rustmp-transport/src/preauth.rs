@@ -7,7 +7,7 @@
 //! In particular, no pre-auth handshake result is automatically admitted to
 //! VerifiedSessions or the gameplay World.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use rustmp_protocol::legacy_frame::{
@@ -31,6 +31,10 @@ pub const MAX_RESEND_DATAGRAMS_PER_POLL: usize = 64;
 pub const PREAUTH_RETRY_DELAY: Duration = Duration::from_millis(300);
 pub const PREAUTH_MAX_RETRIES: u8 = 5;
 pub const PREAUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Throttle expedited retransmission due to lost server replies.
+pub const FAST_DUPLICATE_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Only the last few verified handshake payloads are retained per peer.
+pub const MAX_RECENT_PREAUTH_FRAMES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreAuthError {
@@ -82,6 +86,7 @@ struct Peer {
     incoming: ReceiveWindow,
     outgoing: OutboundReliability,
     acks: PendingAcks,
+    recent_frames: VecDeque<(u16, Vec<u8>)>,
 }
 
 impl Peer {
@@ -91,7 +96,22 @@ impl Peer {
             incoming: ReceiveWindow::default(),
             outgoing: OutboundReliability::new(PREAUTH_RETRY_DELAY, PREAUTH_MAX_RETRIES),
             acks: PendingAcks::default(),
+            recent_frames: VecDeque::new(),
         }
+    }
+
+    fn remember(&mut self, sequence: u16, payload: &[u8]) {
+        if self.recent_frames.iter().any(|(seq,_)| *seq == sequence) {
+            return;
+        }
+        if self.recent_frames.len() >= MAX_RECENT_PREAUTH_FRAMES {
+            self.recent_frames.pop_front();
+        }
+        self.recent_frames.push_back((sequence, payload.to_vec()));
+    }
+
+    fn is_replay_of_accepted(&self, sequence: u16, payload: &[u8]) -> bool {
+        self.recent_frames.iter().any(|(seq, bytes)| *seq == sequence && bytes == payload)
     }
 
     fn encode_outbound(&mut self, payload: &[u8], now: Instant) -> Result<Vec<u8>, PreAuthError> {
@@ -194,6 +214,7 @@ impl PreAuthExchange {
         // The first reliable sequence is normally 0 in this prototype.
         // This assumption must be confirmed against actual client captures.
         state.incoming.observe(0);
+        state.remember(0, request_payload);
         // The offline gateway inspected reliable request #0, but did not
         // acknowledge it. Piggyback this ACK on the first server response:
         // otherwise a valid client keeps retransmitting its initial request.
@@ -236,6 +257,13 @@ impl PreAuthExchange {
             if ahead < 0x8000 && usize::from(ahead) >= crate::reliability::RECEIVE_WINDOW {
                 return Err(PreAuthError::Reliability(ReliabilityError::TooFarAhead));
             }
+            if ahead >= 0x8000
+                && !state.is_replay_of_accepted(frame.sequence, &frame.payload)
+            {
+                // For previously consumed numbers, validate BOTH sequence
+                // and original contents BEFORE applying any piggyback ACK.
+                return Err(PreAuthError::UnexpectedFrame);
+            }
         }
         let mut result = ExchangeResult::default();
         let state = self.peers.get_mut(&peer).ok_or(PreAuthError::UnknownPeer)?;
@@ -249,8 +277,29 @@ impl PreAuthExchange {
             match decision {
                 ReceiveDecision::New => state.acks.mark(frame.sequence)?,
                 ReceiveDecision::Duplicate | ReceiveDecision::Old => {
+                    // Do not ACK or re-transmit for an old sequence reused
+                    // with different bytes. The receive window alone has no
+                    // memory of what the initial pre-auth payload contained.
+                    if !state.is_replay_of_accepted(frame.sequence, &frame.payload) {
+                        return Err(PreAuthError::UnexpectedFrame);
+                    }
                     state.acks.mark(frame.sequence)?;
                     result.duplicate_messages += 1;
+                    // If the peer is repeating a request because our reply
+                    // was lost, expedite ONE previously sent reply, preserving
+                    // its sequence and retry limit. Throttled to 100ms.
+                    if let Some(resend) = state.outgoing.expedite_oldest(
+                        now, FAST_DUPLICATE_RETRY_DELAY,
+                    ) {
+                        result.outgoing.push(encode_datagram(&[], &[Frame {
+                            sequence: resend.sequence,
+                            reliability: Reliability::Reliable,
+                            ordering: None,
+                            payload_bits: (resend.bytes.len() * 8) as u16,
+                            payload: resend.bytes,
+                            split: None,
+                        }])?);
+                    }
                     continue;
                 }
                 ReceiveDecision::TooFarAhead =>
@@ -262,6 +311,7 @@ impl PreAuthExchange {
                 Some(HandshakePhase::AwaitClientConfirmation) =>
                     match self.handshakes.receive_confirmation(peer, &frame.payload, now) {
                         Ok(_profile) => {
+                            state.remember(frame.sequence, &frame.payload);
                             result.transport_confirmed = true;
                             continue;
                         }
@@ -270,7 +320,10 @@ impl PreAuthExchange {
                 None => Err(HandshakeError::UnexpectedState),
             };
             match response {
-                Ok(reply) => result.outgoing.push(state.encode_outbound(&reply, now)?),
+                Ok(reply) => {
+                    result.outgoing.push(state.encode_outbound(&reply, now)?);
+                    state.remember(frame.sequence, &frame.payload);
+                },
                 Err(err) => {
                     self.disconnect(peer);
                     return Err(PreAuthError::Handshake(err));
@@ -488,6 +541,66 @@ mod tests {
         assert_eq!(e.pending_retries(addr),Some(1));
         assert_eq!(e.poll_retries(now+PREAUTH_TIMEOUT).disconnected,vec![addr]);
         assert_eq!(e.len(),0);
+    }
+
+    #[test]
+    fn lost_acceptance_fast_retransmits_once_after_duplicate_with_backoff() {
+        let now=Instant::now();
+        let addr=peer(12210);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        let initial=e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        let request=packet(0,&[8],&[]);
+        let too_early=e.ingest(addr,&request,now+Duration::from_millis(99)).unwrap();
+        assert_eq!(too_early.duplicate_messages,1);
+        assert!(too_early.outgoing.is_empty());
+        let fast=e.ingest(addr,&request,now+FAST_DUPLICATE_RETRY_DELAY).unwrap();
+        assert_eq!(fast.duplicate_messages,1);
+        assert_eq!(fast.outgoing.len(),1);
+        let original=decode_datagram(&initial).unwrap();
+        let retransmitted=decode_datagram(&fast.outgoing[0]).unwrap();
+        assert_eq!(original.frames[0].sequence,retransmitted.frames[0].sequence);
+        assert_eq!(original.frames[0].payload,retransmitted.frames[0].payload);
+        assert!(e.ingest(addr,&request,now+Duration::from_millis(150)).unwrap()
+            .outgoing.is_empty());
+        assert_eq!(e.pending_retries(addr),Some(1));
+        let final_message=packet(1,&confirm(LegacyWireProfile::Samp037),&[0]);
+        assert!(e.ingest(addr,&final_message,now+Duration::from_millis(180))
+            .unwrap().transport_confirmed);
+    }
+
+    #[test]
+    fn altered_duplicate_sequence_is_rejected_without_changing_retry_state() {
+        let now=Instant::now();
+        let addr=peer(12211);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        let mutated=packet(0,&[8,0],&[0]);
+        assert_eq!(e.ingest(addr,&mutated,now+FAST_DUPLICATE_RETRY_DELAY),
+            Err(PreAuthError::UnexpectedFrame));
+        // Piggyback ACK was present, but the request contents were forged.
+        // ACK application on this error path must not invalidate the reply.
+        assert_eq!(e.pending_retries(addr),Some(1));
+        assert_eq!(e.phase(addr),Some(HandshakePhase::AwaitClientConfirmation));
+    }
+
+    #[test]
+    fn valid_duplicate_with_ack_never_resends_acknowledged_response() {
+        let now=Instant::now();
+        let addr=peer(12212);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        let dup=e.ingest(addr,&packet(0,&[8],&[0]),now+FAST_DUPLICATE_RETRY_DELAY)
+            .unwrap();
+        assert_eq!(dup.acknowledged,1);
+        assert_eq!(dup.duplicate_messages,1);
+        assert!(dup.outgoing.is_empty());
+        assert_eq!(e.pending_retries(addr),Some(0));
     }
 
     #[test]

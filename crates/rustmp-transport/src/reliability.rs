@@ -102,6 +102,24 @@ impl OutboundReliability {
         self.outstanding.remove(&sequence).is_some()
     }
 
+    /// Retransmit at most one *already pending* packet early after a peer
+    /// repeats its original reliable request (possible lost server response).
+    /// Never create a new message number or reset retry counters.
+    /// A minimum delay bounds amplification under repeated duplicate traffic.
+    pub fn expedite_oldest(&mut self, now: Instant, minimum_delay: Duration) -> Option<Resend> {
+        let (&sequence, entry) = self.outstanding.iter_mut()
+            .min_by_key(|(_, entry)| entry.last_sent)?;
+        if now.saturating_duration_since(entry.last_sent) < minimum_delay
+            || entry.retries >= self.max_retries
+        {
+            return None;
+        }
+        entry.retries += 1;
+        entry.last_sent = now;
+        Some(Resend { sequence, bytes: entry.bytes.clone(), attempt: entry.retries })
+    }
+
+
     /// Reject untrusted broad or reversed ranges before touching state.
     pub fn acknowledge_range(&mut self, start: u16, end: u16) -> Result<usize, ReliabilityError> {
         if start > end || usize::from(end - start) + 1 > MAX_ACK_RANGE {
@@ -263,6 +281,31 @@ impl OrderedDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_signal_can_resend_original_sequence_early_but_is_rate_limited() {
+        let now=Instant::now();
+        let mut q=OutboundReliability::new(Duration::from_millis(300),2);
+        assert_eq!(q.track_sent(b"accept",now),Ok(0));
+        assert_eq!(q.expedite_oldest(now,Duration::from_millis(100)),None);
+        assert_eq!(q.expedite_oldest(now+Duration::from_millis(99),
+            Duration::from_millis(100)),None);
+        let resent=q.expedite_oldest(now+Duration::from_millis(100),
+            Duration::from_millis(100)).unwrap();
+        assert_eq!(resent.sequence,0);
+        assert_eq!(resent.bytes,b"accept");
+        assert_eq!(resent.attempt,1);
+        assert_eq!(q.expedite_oldest(now+Duration::from_millis(150),
+            Duration::from_millis(100)),None);
+        assert_eq!(q.poll_retries(now+Duration::from_millis(350),1).resend.len(),0);
+        assert_eq!(q.poll_retries(now+Duration::from_millis(400),1).resend[0].attempt,2);
+        assert_eq!(q.expedite_oldest(now+Duration::from_millis(501),
+            Duration::from_millis(100)),None);
+        assert_eq!(q.pending_count(),1);
+        assert!(q.acknowledge(0));
+        assert_eq!(q.expedite_oldest(now+Duration::from_secs(2),
+            Duration::from_millis(100)),None);
+    }
 
     #[test]
     fn reliable_ack_and_retry_expiry() {

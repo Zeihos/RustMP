@@ -97,7 +97,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-RUSTMP server prototype 0.2.0-alpha.13 (NOT gameplay-compatible yet)\n\
+RUSTMP server prototype 0.2.0-alpha.14 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\
@@ -298,9 +298,9 @@ fn run(config: Config, experimental_preauth: bool) -> Result<(), Box<dyn Error>>
                 stats.denied_full, stats.rate_limited, stats.expired_pending);
             if let Some(probe) = experimental.as_ref() {
                 let pre = probe.stats();
-                println!("[NET] localhost pre-auth cookies={} validated={} starts={} confirmed={} rejected={} throttled={} pending={}",
-                    pre.cookie_challenges, pre.cookie_validations, pre.starts,
-                    pre.transport_confirmations, pre.rejected,
+                println!("[NET] localhost pre-auth cookies={} validated={} retransmitted={} starts={} confirmed={} rejected={} throttled={} pending={}",
+                    pre.cookie_challenges, pre.cookie_validations, pre.cookie_retransmissions,
+                    pre.starts, pre.transport_confirmations, pre.rejected,
                     pre.throttled, probe.pending_count());
             }
             last_report = Instant::now();
@@ -519,13 +519,14 @@ mod tests {
         assert_eq!(router.stats().cookie_challenges,1);
         assert_eq!(router.stats().cookie_validations,1);
 
-        // Consumed cookies MUST NOT produce another open reply or any
-        // additional offline peer allocation.
+        // A lost OPEN_CONNECTION_REPLY can be sent again while the
+        // ORIGINAL peer slot exists, without allocating another slot.
         let replay=dispatch_datagram(&[24,lo,hi],peer,now,&world,
             &mut limits,&mut offline,Some(&mut router),server);
-        assert!(replay.is_empty());
+        assert_eq!(replay,vec![vec![25,0]]);
         assert_eq!(offline.pending_count(),1);
         assert_eq!(router.stats().cookie_validations,1);
+        assert_eq!(router.stats().cookie_retransmissions,1);
 
         // This previously could be redeemed with a different UDP port.
         let other:SocketAddr="127.0.0.1:54001".parse().unwrap();
@@ -586,6 +587,16 @@ mod tests {
         let (n,_)=client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n],&[25,0]);
         assert_eq!(offline.pending_count(),1);
+
+        // Repeat the already accepted cookie when the first response is
+        // notionally lost. The same old OPEN_REPLY is retransmitted.
+        client.send_to(&[24,lo,hi],bound).unwrap();
+        let (n,remote)=server.recv_from(&mut buf).unwrap();
+        let again=dispatch_datagram(&buf[..n],remote,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(again,vec![vec![25,0]]);
+        assert_eq!(offline.pending_count(),1);
+        assert_eq!(router.stats().cookie_retransmissions,1);
         assert!(world.query_snapshot().players.is_empty());
     }
 

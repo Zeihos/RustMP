@@ -33,8 +33,13 @@ pub enum CookieFlavor { OriginalSamp, OpenMp }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CookieVerdict {
     Challenge([u8; 3]),
+    /// First successful redemption: creates at most one offline slot.
     Valid(CookieFlavor),
-    /// Already consumed or resource-limited. No datagram should be sent.
+    /// Same endpoint repeated its already redeemed token. The caller MAY
+    /// resend the old offline reply ONLY while a matching slot still exists.
+    /// This verdict must never allocate a new peer.
+    Retransmission(CookieFlavor),
+    /// Wrong token, wrong marker, or resource limit. Must not send an open reply.
     Rejected,
 }
 
@@ -42,7 +47,7 @@ pub enum CookieVerdict {
 struct PendingCookie {
     created: Instant,
     value: u16,
-    consumed: bool,
+    accepted: Option<CookieFlavor>,
 }
 
 /// Fixed-size, per-endpoint cookie state. No session or player is admitted.
@@ -88,7 +93,8 @@ impl CookieGate {
     }
 
     /// Validate an exact three-byte open request or challenge the peer.
-    /// A complete endpoint may redeem a token once, while it is unexpired.
+    /// A complete endpoint may redeem a token only once while unexpired.
+    /// Identical retransmissions are tagged but do not create fresh slots.
     /// A replay from another source port cannot redeem that token.
     pub fn check(&mut self, peer: SocketAddr, request: &[u8], now: Instant)
         -> Option<CookieVerdict>
@@ -100,17 +106,26 @@ impl CookieGate {
         }
         self.cleanup(now);
         if let Some(challenge) = self.pending.get_mut(&peer) {
-            if challenge.consumed {
-                return Some(CookieVerdict::Rejected);
-            }
             let received = u16::from_le_bytes([request[1], request[2]]);
-            if received ^ OMP_COOKIE_XOR == challenge.value {
-                challenge.consumed = true;
-                return Some(CookieVerdict::Valid(CookieFlavor::OpenMp));
+            let flavor = if received ^ OMP_COOKIE_XOR == challenge.value {
+                Some(CookieFlavor::OpenMp)
+            } else if received ^ SAMP_COOKIE_XOR == challenge.value {
+                Some(CookieFlavor::OriginalSamp)
+            } else {
+                None
+            };
+            if let Some(accepted) = challenge.accepted {
+                // A repeated successful response is distinguishable from a
+                // new redemption, and can NEVER allocate another slot.
+                return Some(match flavor {
+                    Some(repeat) if repeat == accepted =>
+                        CookieVerdict::Retransmission(accepted),
+                    _ => CookieVerdict::Rejected,
+                });
             }
-            if received ^ SAMP_COOKIE_XOR == challenge.value {
-                challenge.consumed = true;
-                return Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp));
+            if let Some(flavor) = flavor {
+                challenge.accepted = Some(flavor);
+                return Some(CookieVerdict::Valid(flavor));
             }
             let [lo, hi] = challenge.value.to_le_bytes();
             return Some(CookieVerdict::Challenge([ID_OPEN_CONNECTION_COOKIE, lo, hi]));
@@ -122,7 +137,7 @@ impl CookieGate {
             return Some(CookieVerdict::Rejected);
         }
         let value = self.next_cookie(peer);
-        self.pending.insert(peer, PendingCookie { created: now, value, consumed: false });
+        self.pending.insert(peer, PendingCookie { created: now, value, accepted: None });
         let [lo, hi] = value.to_le_bytes();
         Some(CookieVerdict::Challenge([ID_OPEN_CONNECTION_COOKIE, lo, hi]))
     }
@@ -167,8 +182,8 @@ mod tests {
         assert_eq!(gate.check(p,&retry,now),
             Some(CookieVerdict::Valid(CookieFlavor::OpenMp)));
         assert_eq!(gate.check(p,&retry,now),
-            Some(CookieVerdict::Rejected));
-        assert_eq!(gate.pending_count(),1); // consumed tombstone, no re-admission
+            Some(CookieVerdict::Retransmission(CookieFlavor::OpenMp)));
+        assert_eq!(gate.pending_count(),1); // tombstone, no re-admission
     }
 
     #[test]
@@ -183,7 +198,7 @@ mod tests {
         assert_eq!(gate.check(a,&retry,now),
             Some(CookieVerdict::Valid(CookieFlavor::OriginalSamp)));
         assert_eq!(gate.check(a,&retry,now),
-            Some(CookieVerdict::Rejected));
+            Some(CookieVerdict::Retransmission(CookieFlavor::OriginalSamp)));
     }
 
     #[test]
@@ -202,6 +217,39 @@ mod tests {
         assert_eq!(old,None);
         assert!(matches!(gate.check(p,&[24,0,0],now+COOKIE_TTL),
             Some(CookieVerdict::Challenge(_))));
+    }
+
+
+    #[test]
+    fn consumed_token_cannot_switch_protocol_marker() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        let p=peer(33333);
+        start(&mut gate,p,now);
+        let omp=gate.encode_request(p,CookieFlavor::OpenMp).unwrap();
+        let samp=gate.encode_request(p,CookieFlavor::OriginalSamp).unwrap();
+        assert_eq!(gate.check(p,&omp,now),
+            Some(CookieVerdict::Valid(CookieFlavor::OpenMp)));
+        assert_eq!(gate.check(p,&samp,now),Some(CookieVerdict::Rejected));
+        assert_eq!(gate.check(p,&omp,now),
+            Some(CookieVerdict::Retransmission(CookieFlavor::OpenMp)));
+        assert_eq!(gate.pending_count(),1);
+    }
+
+    #[test]
+    fn retransmission_never_extends_original_cookie_lifetime() {
+        let now=Instant::now();
+        let mut gate=CookieGate::new();
+        let p=peer(33334);
+        start(&mut gate,p,now);
+        let retry=gate.encode_request(p,CookieFlavor::OpenMp).unwrap();
+        assert_eq!(gate.check(p,&retry,now),Some(CookieVerdict::Valid(CookieFlavor::OpenMp)));
+        for i in 1..=3 {
+            assert_eq!(gate.check(p,&retry,now+Duration::from_secs(i)),
+                Some(CookieVerdict::Retransmission(CookieFlavor::OpenMp)));
+        }
+        assert_eq!(gate.cleanup(now+COOKIE_TTL),1);
+        assert_eq!(gate.pending_count(),0);
     }
 
     #[test]

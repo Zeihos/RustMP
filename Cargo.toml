@@ -3,6 +3,6 @@ members = ["crates/rustmp-protocol", "crates/rustmp-core", "crates/rustmp-server
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0-alpha.13"
+version = "0.2.0-alpha.14"
 edition = "2021"
 license = "MIT"

@@ -27,6 +27,8 @@ struct Rate {
 pub struct ProbeStats {
     pub cookie_challenges: u64,
     pub cookie_validations: u64,
+    /// Replied again to a lost offline open reply, without allocating a slot.
+    pub cookie_retransmissions: u64,
     pub starts: u64,
     pub transport_confirmations: u64,
     pub rejected: u64,
@@ -82,6 +84,18 @@ impl ExperimentalPreAuth {
             Some(CookieVerdict::Valid(_)) => {
                 self.stats.cookie_validations += 1;
                 Ok(())
+            }
+            Some(CookieVerdict::Retransmission(_)) => {
+                // Allow the existing OfflineGateway pending peer to resend
+                // its open reply. This is NOT another cookie acceptance:
+                // absent/expired/released slots cannot be recreated.
+                if offline.pending_profile(peer, now) == Some(LegacyWireProfile::OpenMpRakNet) {
+                    self.stats.cookie_retransmissions += 1;
+                    Ok(())
+                } else {
+                    self.stats.rejected += 1;
+                    Err(Vec::new())
+                }
             }
             Some(CookieVerdict::Rejected) => {
                 self.stats.rejected += 1;
@@ -301,14 +315,61 @@ mod tests {
         let [lo,hi]=(cookie ^ 0x6d70).to_le_bytes();
         assert_eq!(router.check_cookie(&[24,lo,hi],sender,now,&gateway),Ok(()));
         assert_eq!(gateway.handle(&[24,lo,hi],sender,now),Some(vec![25,0]));
-        assert!(router.check_cookie(&[24,lo,hi],sender,now,&gateway).is_err());
+        // A lost open-reply can now be resent by the original peer.
+        assert_eq!(router.check_cookie(&[24,lo,hi],sender,now,&gateway),Ok(()));
+        assert_eq!(gateway.handle(&[24,lo,hi],sender,now),Some(vec![25,0]));
         assert_eq!(router.stats().cookie_validations,1);
+        assert_eq!(router.stats().cookie_retransmissions,1);
         assert_eq!(gateway.pending_count(),1);
         let other_port=peer(52121);
         // The copied response is NOT valid for another source port.
         let answer=router.check_cookie(&[24,lo,hi],other_port,now,&gateway).unwrap_err();
         assert_eq!(answer[0],26);
         assert_eq!(gateway.pending_count(),1);
+    }
+
+
+    #[test]
+    fn redeemed_cookie_rejected_if_offline_slot_was_released() {
+        let now=Instant::now();
+        let sender=peer(52122);
+        let mut gateway=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        router.check_cookie(&[24,0,0],sender,now,&gateway).unwrap_err();
+        let packet=router.cookie.encode_request(
+            sender,rustmp_transport::cookie::CookieFlavor::OpenMp).unwrap();
+        assert_eq!(router.check_cookie(&packet,sender,now,&gateway),Ok(()));
+        assert_eq!(gateway.handle(&packet,sender,now),Some(vec![25,0]));
+        assert!(gateway.release_pending(sender));
+        assert!(router.check_cookie(&packet,sender,now,&gateway).is_err());
+        assert_eq!(router.stats().cookie_validations,1);
+        assert_eq!(router.stats().cookie_retransmissions,0);
+        assert_eq!(gateway.pending_count(),0);
+    }
+
+    #[test]
+    fn lost_open_reply_retries_do_not_extend_slot_lifetime() {
+        use rustmp_transport::HANDSHAKE_TIMEOUT;
+        let now=Instant::now();
+        let sender=peer(52123);
+        let mut gateway=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        router.check_cookie(&[24,0,0],sender,now,&gateway).unwrap_err();
+        let packet=router.cookie.encode_request(
+            sender,rustmp_transport::cookie::CookieFlavor::OpenMp).unwrap();
+        assert_eq!(router.check_cookie(&packet,sender,now,&gateway),Ok(()));
+        assert_eq!(gateway.handle(&packet,sender,now),Some(vec![25,0]));
+        for step in 1..4 {
+            let later=now+Duration::from_secs(step);
+            assert_eq!(router.check_cookie(&packet,sender,later,&gateway),Ok(()));
+            assert_eq!(gateway.handle(&packet,sender,later),Some(vec![25,0]));
+        }
+        assert_eq!(router.stats().cookie_retransmissions,3);
+        assert_eq!(gateway.pending_profile(sender,now+HANDSHAKE_TIMEOUT),None);
+        // Cookie TTL is shorter than offline slot lifetime.
+        assert_eq!(router.cookie.pending_count(),1);
+        router.cleanup(now+Duration::from_secs(4));
+        assert_eq!(router.cookie.pending_count(),0);
     }
 
     #[test]
