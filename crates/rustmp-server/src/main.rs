@@ -22,6 +22,8 @@ use serde_json::Value;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(20); // 50 ticks/s (prototype)
 const QUERY_LIMIT_PER_IP_PER_SEC: u16 = 30;
+/// Prevent unlimited growth of the public UDP query rate limiter.
+const MAX_TRACKED_QUERY_IPS: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct RateLimit {
@@ -30,8 +32,13 @@ struct RateLimit {
 }
 
 fn query_allowed(limits: &mut HashMap<IpAddr, RateLimit>, ip: IpAddr, now: Instant) -> bool {
+    // Never allocate unbounded state for spoofed or rotating addresses.
+    // Existing addresses can still use their already-allocated bucket.
+    if !limits.contains_key(&ip) && limits.len() >= MAX_TRACKED_QUERY_IPS {
+        return false;
+    }
     let rate = limits.entry(ip).or_insert(RateLimit { window_start: now, count: 0 });
-    if now.duration_since(rate.window_start) >= Duration::from_secs(1) {
+    if now.saturating_duration_since(rate.window_start) >= Duration::from_secs(1) {
         rate.window_start = now;
         rate.count = 0;
     }
@@ -97,7 +104,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("\
-RUSTMP server prototype 0.2.0-alpha.14 (NOT gameplay-compatible yet)\n\
+RUSTMP server prototype 0.2.0-alpha.15 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
   --bind IP            Bind address (default 0.0.0.0)\n\
@@ -228,7 +235,14 @@ fn dispatch_datagram(
 }
 
 fn run(config: Config, experimental_preauth: bool) -> Result<(), Box<dyn Error>> {
-
+    // Fail closed BEFORE binding. This avoids briefly exposing the incomplete
+    // diagnostic handshake to a public interface or unexpected DNS result.
+    if experimental_preauth
+        && !config.bind.parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_ipv4() && ip.is_loopback())
+    {
+        return Err("--experimental-preauth requires an explicit IPv4 loopback --bind".into());
+    }
     let socket = UdpSocket::bind((config.bind.as_str(), config.port))?;
     socket.set_nonblocking(true)?;
     let addr = socket.local_addr()?;
@@ -277,7 +291,7 @@ fn run(config: Config, experimental_preauth: bool) -> Result<(), Box<dyn Error>>
         }
         world.tick();
         if let Some(probe) = experimental.as_mut() {
-            let retries = probe.poll_retries(Instant::now());
+            let retries = probe.poll_retries(Instant::now(), &mut offline);
             for packet in retries.packets {
                 if let Err(e) = socket.send_to(&packet.bytes, packet.peer) {
                     eprintln!("[WARN] pre-auth resend to {} failed: {e}", packet.peer);
@@ -359,6 +373,34 @@ mod tests {
         }
         assert!(!query_allowed(&mut limits, ip, now));
         assert!(query_allowed(&mut limits, ip, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn public_query_rate_limiter_is_memory_bounded() {
+        let now=Instant::now();
+        let mut limits=HashMap::new();
+        for n in 0..MAX_TRACKED_QUERY_IPS {
+            let addr=IpAddr::from([198, 18, (n / 256) as u8, (n % 256) as u8]);
+            assert!(query_allowed(&mut limits,addr,now));
+        }
+        assert_eq!(limits.len(),MAX_TRACKED_QUERY_IPS);
+        let extra:IpAddr="198.19.0.1".parse().unwrap();
+        for _ in 0..20 {
+            assert!(!query_allowed(&mut limits,extra,now));
+        }
+        assert_eq!(limits.len(),MAX_TRACKED_QUERY_IPS);
+        // Previously tracked sources do not become blocked by the cap.
+        assert!(query_allowed(&mut limits,"198.18.0.0".parse().unwrap(),now));
+        // The main loop periodically prunes expired entries. The cap then
+        // allows a new source without allocating beyond MAX_TRACKED_QUERY_IPS.
+        limits.retain(|_,rate| now.saturating_duration_since(rate.window_start)
+            <Duration::from_secs(2));
+        assert!(!query_allowed(&mut limits,extra,now));
+        let later=now+Duration::from_secs(3);
+        limits.retain(|_,rate| later.saturating_duration_since(rate.window_start)
+            <Duration::from_secs(2));
+        assert!(query_allowed(&mut limits,extra,later));
+        assert_eq!(limits.len(),1);
     }
 
     #[test]

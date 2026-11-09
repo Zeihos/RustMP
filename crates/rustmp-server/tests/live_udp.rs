@@ -130,3 +130,34 @@ fn default_binary_does_not_complete_a_reliable_handshake() {
         result => panic!("unexpected reply from default server: {result:?}"),
     }
 }
+
+
+#[test]
+fn production_binding_is_rejected_before_opening_public_diagnostic_socket() {
+    for address in ["0.0.0.0", "192.0.2.10", "::1"] {
+        let result=Command::new(env!("CARGO_BIN_EXE_rustmp-server"))
+            .args(["--bind",address,"--experimental-preauth"])
+            .output().expect("run server executable");
+        assert!(!result.status.success(), "must refuse diagnostic on {address}");
+        let stderr=String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("explicit IPv4 loopback"),
+            "unexpected error for {address}: {stderr}");
+    }
+}
+
+#[test]
+fn malformed_udp_flood_does_not_break_next_legitimate_probe() {
+    let mut server=LocalProcess::start(true);
+    let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
+
+    // The diagnostic transport must ignore oversized or nonsensical input
+    // rather than terminate its process or allocate a second peer.
+    for n in 0..48 {
+        let mut garbage=vec![0xff;20+(n%50)];
+        garbage[0]=0xEE;
+        client.send_to(&garbage,server.address).unwrap();
+    }
+    let pong=server.first_reply(&client,&[3,1,2,3,4]);
+    assert_eq!(pong,vec![37,1,2,3,4]);
+}

@@ -220,8 +220,15 @@ impl ExperimentalPreAuth {
         }
     }
 
-    pub fn poll_retries(&mut self, now: Instant) -> RetryResult {
-        self.exchange.poll_retries(now)
+    /// Poll reliable retries and immediately release gateway slots when
+    /// a peer exhausts its retries or pre-auth lifetime. Otherwise a dead
+    /// exchange could occupy the offline gateway until its separate TTL.
+    pub fn poll_retries(&mut self, now: Instant, offline: &mut OfflineGateway) -> RetryResult {
+        let result = self.exchange.poll_retries(now);
+        for peer in &result.disconnected {
+            offline.release_pending(*peer);
+        }
+        result
     }
 
     pub fn cleanup(&mut self, now: Instant) {
@@ -449,7 +456,7 @@ mod tests {
         assert!(router.handle(&bad,sender,peer(7777),&mut gateway,b"",now).is_empty());
         assert_eq!(router.pending_count(),1);
         assert_eq!(gateway.pending_count(),1);
-        assert_eq!(router.poll_retries(now+Duration::from_millis(300)).packets.len(),1);
+        assert_eq!(router.poll_retries(now+Duration::from_millis(300),&mut gateway).packets.len(),1);
 
         let good=router.handle(&packet(1,&[26,127,0,0,1,0x61,0x1e],&[0]),
             sender,peer(7777),&mut gateway,b"",now);
@@ -458,6 +465,34 @@ mod tests {
         assert_eq!(router.stats().transport_confirmations,1);
     }
     #[test]
+    fn retry_exhaustion_releases_offline_and_reliable_slots_together() {
+        let now=Instant::now();
+        let address=peer(52440);
+        let mut gateway=OfflineGateway::new(2);
+        gateway.handle(&[16,0,0],address,now);
+        let mut router=ExperimentalPreAuth::new();
+        assert_eq!(router.handle(&packet(0,&[8],&[]),address,peer(7777),
+            &mut gateway,b"",now).len(),1);
+        for attempt in 1..=5 {
+            let poll=router.poll_retries(
+                now+Duration::from_millis(300 * attempt),&mut gateway);
+            assert_eq!(poll.packets.len(),1);
+            assert!(poll.disconnected.is_empty());
+            assert_eq!(router.pending_count(),1);
+            assert_eq!(gateway.pending_count(),1);
+        }
+        let exhausted=router.poll_retries(
+            now+Duration::from_millis(1800),&mut gateway);
+        assert!(exhausted.packets.is_empty());
+        assert_eq!(exhausted.disconnected,vec![address]);
+        assert_eq!(router.pending_count(),0);
+        assert_eq!(gateway.pending_count(),0);
+        // A second offline request is now able to reuse the released slot.
+        assert_eq!(gateway.handle(&[16,0,0],address,
+            now+Duration::from_millis(1801)),Some(vec![17,0]));
+    }
+
+    #[test]
     fn retry_packets_preserve_destination_for_udp_send_to() {
         let now=Instant::now();
         let client=peer(52004);
@@ -465,7 +500,7 @@ mod tests {
         gateway.handle(&[16,0,0],client,now);
         let mut router=ExperimentalPreAuth::new();
         router.handle(&packet(0,&[8],&[]),client,peer(7777),&mut gateway,b"",now);
-        let retry=router.poll_retries(now+Duration::from_millis(300));
+        let retry=router.poll_retries(now+Duration::from_millis(300),&mut gateway);
         assert_eq!(retry.packets.len(),1);
         assert_eq!(retry.packets[0].peer,client);
         assert_eq!(decode_datagram(&retry.packets[0].bytes).unwrap().frames[0].sequence,0);
