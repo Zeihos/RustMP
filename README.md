@@ -1,104 +1,174 @@
-# RUSTMP
+<div align="center">
 
-[![Rust CI](https://github.com/Zeihos/RustMP/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/Zeihos/RustMP/actions/workflows/rust.yml)
-![License: MIT](https://img.shields.io/badge/license-MIT-blue)
-![Status: alpha](https://img.shields.io/badge/status-experimental-orange)
+<h1>RUSTMP</h1>
 
-**RUSTMP** — открытый исследовательский проект серверной платформы на **Rust**, ориентированный на сетевую совместимость с **SA-MP 0.3.7** и **open.mp**. Не является официальной разработкой SA-MP/open.mp и не представляет собой готовый игровой мод.
+<p><strong>Независимая серверная платформа на Rust.</strong></p>
+<p>Исследуем и постепенно реализуем совместимость с сетевыми протоколами <strong>SA-MP 0.3.7</strong> и <strong>open.mp</strong>.</p>
 
-> [!WARNING]
-> **Версия 0.2.0-alpha.17 — неиграбельный прототип.** Настоящие клиенты GTA San Andreas пока не могут полноценно подключиться и войти в игровой мир. Результаты автоматических тестов не доказывают совместимость с реальными клиентами. Не открывайте экспериментальный протокол для публичного доступа.
+<p>
+  <a href="https://github.com/Zeihos/RustMP/actions/workflows/rust.yml"><img src="https://github.com/Zeihos/RustMP/actions/workflows/rust.yml/badge.svg?branch=main" alt="Сборка Windows и Linux"></a>
+  <a href="https://github.com/Zeihos/RustMP/blob/main/LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-64748b" alt="Лицензия MIT"></a>
+  <img src="https://img.shields.io/badge/Rust-2021-CE422B?logo=rust&logoColor=white" alt="Rust 2021">
+  <img src="https://img.shields.io/badge/стадия-альфа-F59E0B" alt="Стадия: альфа">
+</p>
 
-## Текущие возможности
+<p>
+  <a href="#возможности">Возможности</a> ·
+  <a href="#быстрый-старт">Быстрый старт</a> ·
+  <a href="#план-разработки">План разработки</a> ·
+  <a href="#документация">Документация</a> ·
+  <a href="#участие-в-проекте">Участие
+  </a>
+</p>
 
-| Подсистема | Статус |
-| --- | --- |
-| Rust workspace, серверный цикл, конфигурация | Работает, тестируется на Windows и Linux |
-| SA-MP UDP Query и офлайн-ответы RakNet | Реализованы и покрыты тестами |
-| Кодеки BitStream, ACK, reliable frames, фрагментация | Библиотечные реализации; не полный сетевой стек |
-| Pre-auth handshake и retry | Экспериментальная диагностика **только на 127.0.0.1** |
-| Анализ PCAP, отслеживание offline handshake | CLI `rustmp-trace`; синтетические тесты |
-| Аутентификация реального клиента, игровые RPC, синхронизация | Не реализованы |
-| Pawn/AMX, полноценные игровые режимы и плагины | Не реализованы |
+</div>
 
-Подробный статус по этапам — [PORTING_PLAN.md](PORTING_PLAN.md). История версий — [CHANGELOG.md](CHANGELOG.md).
+---
+
+> [!IMPORTANT]
+> **Текущая версия — `0.2.0-alpha.17`.** RUSTMP пока **не является готовым игровым сервером**. Полноценное подключение GTA San Andreas, авторизация игроков, игровые RPC и синхронизация ещё не реализованы. Автоматические тесты проверяют прототип, но не подтверждают совместимость с реальными клиентами.
+
+## О проекте
+
+RUSTMP — открытая разработка серверной платформы с нуля на **Rust**. Наша цель — изучить и воспроизвести необходимые части сетевого стека SA-MP/open.mp без использования C++-обёртки, сохраняя контроль над надёжной доставкой, памятью и безопасностью.
+
+Проект разделён на четыре самостоятельных Rust-крейта. Сейчас основной упор — на UDP Query, legacy RakNet, тестовую сетевую диагностику и инструменты проверки протокольных захватов.
+
+## Возможности
+
+| Компонент | Состояние | Что доступно |
+| :--- | :---: | :--- |
+| **UDP Query** | ✅ Тестируется | Обработка запросов SA-MP, информация о сервере |
+| **Legacy RakNet** | 🟡 Частично | Offline ping/open, кодеки ACK, reliable frames, фрагментация |
+| **Pre-auth и повторная доставка** | 🧪 Локальный тест | Диагностический handshake, таймауты, ACK/retry |
+| **Анализатор `rustmp-trace`** | ✅ Тестируется | Разбор classic PCAP, проверка последовательности offline-пакетов |
+| **Модель мира** | 🟡 Основа | Пулы ID и тестовые структуры сущностей |
+| **Подключение реального игрока** | ⚪ Не готово | Требуются проверка клиента, авторизация и игровой RPC |
+| **Игровая синхронизация и Pawn/AMX** | ⚪ Не готово | Запланировано для будущих этапов |
+
+<sub>✅ Есть автоматические проверки · 🟡 Реализовано частично · 🧪 Только диагностика на localhost · ⚪ В разработке. Ни один статус не означает готовый публичный игровой сервер.</sub>
 
 ## Быстрый старт
 
-**Требования:** установленный [Rust и Cargo](https://rustup.rs/) (stable), Git и Windows или Linux. Команды выполняются из корня репозитория.
+Для сборки нужны [Rust и Cargo](https://rustup.rs/) (stable), Git и **Windows или Linux**.
+
+**1. Получить исходники и проверить проект**
 
 ```bash
 git clone https://github.com/Zeihos/RustMP.git
 cd RustMP
 cargo check --locked --workspace --all-targets
-cargo test --locked --workspace
+cargo test --locked --workspace --all-targets
 ```
 
-Запуск диагностического UDP-сервера:
+**2. Запустить сервер протокольной диагностики**
 
 ```bash
 cargo run --locked --release -p rustmp-server -- --config config.json
 ```
 
-По умолчанию в `config.json` указан `127.0.0.1:7777`: сервер доступен только на этой машине. Для проверки SA-MP Query во втором терминале:
+В стандартной конфигурации сервер слушает **127.0.0.1:7777** — доступен только на вашем ПК. В отдельном терминале можно проверить SA-MP Query:
 
 ```bash
 cargo run --locked -p rustmp-protocol --example query_client -- 127.0.0.1 7777
 ```
 
-Для проверки офлайн-обмена RakNet:
+На Windows также доступны `start-windows.bat` и `test-windows.bat`.
+
+<details>
+<summary><b>Проверить legacy RakNet и экспериментальный handshake</b></summary>
+
+Для проверки offline-пакета при работающем сервере:
 
 ```bash
 cargo run --locked -p rustmp-transport --example offline_probe -- 127.0.0.1:7777
 ```
 
-На Windows также доступны `test-windows.bat` и `start-windows.bat`.
-
-### Экспериментальный pre-auth (локально)
+Для **отдельного локального теста pre-auth** сначала остановите обычный сервер и запустите:
 
 ```bash
 cargo run --locked -p rustmp-server -- --bind 127.0.0.1 --port 7777 --experimental-preauth
 ```
 
-Флаг включает ограниченный диагностический транспортный обмен; **он не подключает игрового клиента**. Запуск с этим флагом на `0.0.0.0`, публичном IP или IPv6 запрещён кодом сервера. Для локальных протокольных пробников доступны `local_preauth_probe` и `local_cookie_probe` в `rustmp-protocol/examples/`.
+Во втором терминале:
 
-### Анализ сохранённого сетевого захвата
+```bash
+cargo run --locked -p rustmp-protocol --example local_preauth_probe -- 127.0.0.1:7777
+```
+
+Режим `--experimental-preauth` разрешён **только на IPv4 loopback** и не выполняет полноценный игровой вход. Не открывайте его в интернет.
+
+</details>
+
+<details>
+<summary><b>Проанализировать сетевой дамп с помощью rustmp-trace</b></summary>
 
 ```bash
 cargo run --locked -p rustmp-protocol --bin rustmp-trace -- capture.pcap --port 7777 --handshakes
 ```
 
-`rustmp-trace` читает **классический PCAP**, распознаёт известные offline-пакеты и фиксирует повторы/пропуски **в захвате**. IP-адреса скрыты по умолчанию; содержимое пакетов не печатается. Инструкция и ограничения — [TRACE_ANALYSIS.md](TRACE_ANALYSIS.md).
+Инструмент анализирует **классический .pcap**, а не `.pcapng`. Он показывает метаданные пакетов, повторы и отсутствие ответов **в захвате**. IP-адреса скрываются по умолчанию, содержимое пакетов не печатается. Подробности — в [руководстве по анализу PCAP](TRACE_ANALYSIS.md).
 
-## Структура репозитория
+</details>
+
+## Архитектура
 
 ```text
-crates/
-  rustmp-core/        Пулы объектов и модель серверного мира
-  rustmp-protocol/    SA-MP Query, BitStream, RakNet-кодеки, PCAP-анализатор
-  rustmp-transport/   Offline gateway, ACK/retry, pre-auth, сессии
-  rustmp-server/      UDP-сервер и локальная диагностика
-.github/              CI, шаблоны Issues и Pull Requests
-config.json           Локальная конфигурация
+RUSTMP/
+├── crates/
+│   ├── rustmp-core/         Модель мира и пулы сущностей
+│   ├── rustmp-protocol/     UDP Query, кодеки RakNet, анализ PCAP
+│   ├── rustmp-transport/    Offline gateway, ACK, retry и pre-auth
+│   └── rustmp-server/       UDP-сервер и маршрутизация
+├── .github/                 CI и шаблоны взаимодействия
+├── config.json              Конфигурация диагностического сервера
+└── Cargo.toml               Общее рабочее пространство
 ```
 
-Технические границы подсистем описаны в [ARCHITECTURE.md](ARCHITECTURE.md).
+Устройство подсистем и границы тестовой реализации описаны в [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Разработка
+## План разработки
 
-Проверить workspace:
+| Этап | Задача | Статус |
+| :--- | :--- | :--- |
+| 01 | Rust workspace, модель мира, UDP Query | **Основа реализована** |
+| 02 | Legacy RakNet: offline-пакеты, надёжная доставка | **В работе** |
+| 03 | Сверка с настоящими клиентами SA-MP/open.mp | **Ожидает реальных захватов** |
+| 04 | Авторизация, RPC, подключение и синхронизация игроков | **Не начато** |
+| 05 | Pawn/AMX, игровые системы, расширения | **Не начато** |
+| 06 | Проверка совместимости, безопасность, релиз 1.0 | **В перспективе** |
 
-```bash
-cargo check --locked --workspace --all-targets
-cargo test --locked --workspace
-```
+Полный перечень работ и критерии завершения — в **[PORTING_PLAN.md](PORTING_PLAN.md)**.
 
-GitHub Actions выполняет проверки на **Linux и Windows**. Тесты используют синтетические пакеты и локальные UDP-сокеты, включая запуск отдельного процесса сервера. **Реальных захватов SA-MP/open.mp клиентов в репозитории пока нет.**
+## Документация
 
-Исправления и предложения приветствуются: [CONTRIBUTING.md](CONTRIBUTING.md). О потенциальных уязвимостях сообщайте согласно [SECURITY.md](SECURITY.md), не публикуя пароли, сетевые дампы и готовые эксплойты в открытых Issues.
+| Документ | Содержание |
+| :--- | :--- |
+| [Архитектура](ARCHITECTURE.md) | Устройство компонентов и ограничения прототипа |
+| [План разработки](PORTING_PLAN.md) | Реализованные этапы и дальнейшие задачи |
+| [История изменений](CHANGELOG.md) | Что менялось от версии к версии |
+| [Анализ сетевых захватов](TRACE_ANALYSIS.md) | Использование `rustmp-trace` |
+| [Участие в разработке](CONTRIBUTING.md) | Как подготовить исправление или Pull Request |
+| [Безопасность](SECURITY.md) | Как приватно сообщить об уязвимости |
 
-## Лицензия и источники
+## Участие в проекте
 
-Собственный код RUSTMP распространяется по [MIT](LICENSE). Совместимость исследуется по опубликованным материалам и исходникам [open.mp](https://github.com/openmultiplayer/open.mp), [форка RakNet openmultiplayer](https://github.com/openmultiplayer/RakNet) и [SA-MP](https://github.com/Alf21/samp). Их названия принадлежат соответствующим правообладателям.
+RUSTMP развивается открыто. Можно [сообщить об ошибке](https://github.com/Zeihos/RustMP/issues/new/choose), [предложить функцию](https://github.com/Zeihos/RustMP/issues/new/choose) или [отправить Pull Request](https://github.com/Zeihos/RustMP/pulls).
 
-Перенос исходных файлов сторонних проектов требует отдельного соблюдения их лицензий (в частности, MPL-2.0 там, где применимо). Наличие совместимого протокола не подразумевает официальной аффилиации.
+Прежде чем отправлять изменения, ознакомьтесь с [правилами участия](CONTRIBUTING.md). **Не публикуйте пароли, токены, неочищенные PCAP-файлы и данные реальных пользователей.**
+
+---
+
+<div align="center">
+
+<p><strong>RUSTMP · Независимый проект · Rust · Открытый исходный код</strong></p>
+
+<p>
+  <a href="LICENSE">MIT</a> ·
+  <a href="https://github.com/Zeihos/RustMP/actions">Сборки</a> ·
+  <a href="https://github.com/Zeihos/RustMP/issues">Задачи</a>
+</p>
+
+<sub>Проект не связан официально с разработчиками SA-MP или open.mp. Лицензии сторонних исходников и библиотек необходимо соблюдать отдельно.</sub>
+
+</div>
