@@ -3,7 +3,7 @@ name = "rustmp-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Rust implementation of legacy SA-MP query protocol"
+description = "SA-MP/open.mp protocol codecs, UDP query and classic PCAP analysis"
 
 [dependencies]
 encoding_rs = "0.8"

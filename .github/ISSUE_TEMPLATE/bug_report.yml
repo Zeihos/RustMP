@@ -1,0 +1,52 @@
+name: "Ошибка / Bug report"
+description: "Воспроизводимая проблема в RUSTMP (не запрос на подключение готового игрового клиента)"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Не публикуйте пароли, токены и неочищенные PCAP. Уязвимости сообщайте приватно по SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: "Версия или commit SHA"
+      placeholder: "0.2.0-alpha.17 / SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: "Подсистема"
+      options:
+        - UDP Query / server
+        - RakNet / transport
+        - PCAP inspector
+        - Core / entity pools
+        - Build / CI / Windows
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Шаги воспроизведения"
+      description: "Конкретные локальные команды и синтетические входные данные"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Фактическое поведение"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Ожидаемое поведение"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: "ОС и Rust toolchain"
+      placeholder: "Windows 11 / stable или Ubuntu / stable"

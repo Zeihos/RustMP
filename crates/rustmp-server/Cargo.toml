@@ -3,7 +3,7 @@ name = "rustmp-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Standalone SA-MP offline RakNet and query Rust server prototype (not a playable server yet)"
+description = "Experimental Rust UDP Query and offline RakNet server (not playable)"
 
 [dependencies]
 rustmp-core = { path = "../rustmp-core" }

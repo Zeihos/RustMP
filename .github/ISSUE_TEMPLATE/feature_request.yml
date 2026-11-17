@@ -1,0 +1,21 @@
+name: "Предложение / Feature request"
+description: "Идея для протокольной, серверной или диагностической части RUSTMP"
+title: "[Feature] "
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: "Задача и ожидаемый результат"
+      description: "Что станет возможным после изменения?"
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: "Предлагаемое решение"
+      description: "Ссылки на документацию wire-формата, тестовые сценарии и ограничения"
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: "Влияние на SA-MP/open.mp и безопасность"
+      description: "Как доказать совместимость, не объявляя реального клиента поддерживаемым заранее?"

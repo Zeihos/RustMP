@@ -69,7 +69,7 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
     }
     if let Some(network) = doc.get("network") {
         if let Some(value) = string_field(network, "bind") {
-            cfg.bind = if value.is_empty() { "0.0.0.0".into() } else { value };
+            cfg.bind = if value.is_empty() { "127.0.0.1".into() } else { value };
         }
         if let Some(value) = network.get("port").and_then(Value::as_u64) {
             cfg.port = u16::try_from(value)?;
@@ -107,7 +107,7 @@ fn print_help() {
 RUSTMP server prototype 0.2.0-alpha.17 (NOT gameplay-compatible yet)\n\
 Usage: cargo run --release -p rustmp-server -- [options]\n\
   --config PATH        Read a subset of the open.mp config.json format\n\
-  --bind IP            Bind address (default 0.0.0.0)\n\
+  --bind IP            Bind address (default 127.0.0.1)\n\
   --port PORT          UDP port (default 7777)\n\
   --name TEXT          Name shown in the legacy server query\n\
   --mode TEXT          Gamemode shown in the query\n\

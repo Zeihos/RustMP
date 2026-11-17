@@ -1,8 +1,24 @@
+# Rust build output
 /target/
 **/target/
 **/*.rs.bk
-.DS_Store
-Thumbs.db
+
+# Local configuration, credentials and editor state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
 *.log
 *.tmp
-.idea/
+
+# Network captures may contain tokens, passwords or user data.
+*.pcap
+*.pcapng
+*.cap
+
+# Generated build artifacts and machine files
+/coverage/
+/dist/
+.DS_Store
+Thumbs.db

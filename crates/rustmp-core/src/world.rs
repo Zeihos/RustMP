@@ -66,7 +66,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0".into(),
+            bind: "127.0.0.1".into(),
             port: 7777,
             max_players: 50,
             hostname: "RUSTMP development server".into(),

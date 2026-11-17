@@ -1,27 +1,39 @@
-name: Rust tests
+name: Rust CI
+
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check workspace
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo build files
+        uses: Swatinem/rust-cache@v2
+      - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets
-      - name: Unit tests
-        run: cargo test --locked --workspace
-
-      - name: Check server command-line entry point
+      - name: Test all workspace targets
+        run: cargo test --locked --workspace --all-targets
+      - name: Check server CLI
         run: cargo run --locked -p rustmp-server -- --help
-
-      - name: Check offline PCAP inspector entry point
+      - name: Check PCAP inspector CLI
         run: cargo run --locked -p rustmp-protocol --bin rustmp-trace -- --help

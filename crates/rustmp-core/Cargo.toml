@@ -3,7 +3,7 @@ name = "rustmp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core world state and reusable entity pools for a Rust open.mp port"
+description = "Core entity pools and world state model for RustMP"
 
 [dependencies]
 rustmp-protocol = { path = "../rustmp-protocol" }
