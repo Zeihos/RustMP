@@ -154,6 +154,7 @@ mod tests {
         UdpEvent {
             record:n,seconds:10,fraction:n as u32,source:src,destination:dst,
             wire_bytes:3,kind:FrameKind::Offline{profile,message},
+            reliable:None,
         }
     }
     fn r(events:Vec<UdpEvent>)->CaptureReport {

@@ -149,3 +149,75 @@ fn flow_analysis_needs_explicit_server_port_and_endpoints_are_opt_in() {
     assert!(String::from_utf8_lossy(&allowed.stdout)
         .contains("192.0.2.10:45000 -> 192.0.2.11:7777"));
 }
+
+
+fn reliable_frame(sequence:u16, data:&[u8]) -> rustmp_protocol::legacy_frame::Frame {
+    use rustmp_protocol::legacy_frame::{Frame, Reliability};
+    Frame {
+        sequence, reliability:Reliability::Reliable,
+        ordering:None, split:None, payload_bits:(data.len()*8) as u16,
+        payload:data.to_vec(),
+    }
+}
+
+fn append_capture_record(dst:&mut Vec<u8>, packet:&[u8], server_to_client:bool) {
+    let mut fixture=test_capture(packet);
+    if server_to_client {
+        let offset=24+16+14;
+        fixture[offset+12..offset+16].copy_from_slice(&[192,0,2,11]);
+        fixture[offset+16..offset+20].copy_from_slice(&[192,0,2,10]);
+        fixture[offset+20..offset+22].copy_from_slice(&7777u16.to_be_bytes());
+        fixture[offset+22..offset+24].copy_from_slice(&45000u16.to_be_bytes());
+    }
+    dst.extend_from_slice(&fixture[24..]);
+}
+
+#[test]
+fn reliable_cli_correlates_all_frame_ids_and_both_directions_without_payload() {
+    use rustmp_protocol::legacy_frame::encode_datagram;
+    let req=encode_datagram(&[],&[
+        reliable_frame(0,b"PRIVATE-CLIENT-SECRET"),
+        reliable_frame(1,b"second"),
+    ]).unwrap();
+    let resent=encode_datagram(&[],&[reliable_frame(0,b"PRIVATE-CLIENT-SECRET")]).unwrap();
+    let reply=encode_datagram(&[0,1],&[reliable_frame(7,b"PRIVATE-SERVER-SECRET")]).unwrap();
+    let ack=encode_datagram(&[7],&[]).unwrap();
+
+    let mut capture=test_capture(&req);
+    append_capture_record(&mut capture,&resent,false);
+    append_capture_record(&mut capture,&reply,true);
+    append_capture_record(&mut capture,&ack,false);
+    let fixture=TempCapture::write(&capture);
+    let output=Command::new(env!("CARGO_BIN_EXE_rustmp-trace"))
+        .arg(&fixture.0).args(["--port","7777","--reliable"])
+        .output().unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let out=String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("reliable_flows=1 confirmed=3 outstanding_in_capture=0"));
+    assert!(out.contains("client_frames=3 server_frames=1"));
+    assert!(out.contains("client_confirmed=2 server_confirmed=1"));
+    assert!(out.contains("client_repeated=1 server_repeated=0"));
+    assert!(out.contains("IP-hidden:45000 -> IP-hidden:7777"));
+    assert!(!out.contains("PRIVATE-CLIENT-SECRET"));
+    assert!(!out.contains("PRIVATE-SERVER-SECRET"));
+    assert!(!out.contains("192.0.2.10"));
+}
+
+#[test]
+fn reliable_cli_reports_unobserved_ack_and_rejects_ambiguous_server_port() {
+    use rustmp_protocol::legacy_frame::encode_datagram;
+    let packet=encode_datagram(&[],&[reliable_frame(12,b"pending")]).unwrap();
+    let fixture=TempCapture::write(&test_capture(&packet));
+    let binary=env!("CARGO_BIN_EXE_rustmp-trace");
+    let no_port=Command::new(binary).arg(&fixture.0).arg("--reliable").output().unwrap();
+    assert!(!no_port.status.success());
+    assert!(String::from_utf8_lossy(&no_port.stderr).contains("--reliable requires --port"));
+
+    let report=Command::new(binary).arg(&fixture.0).args(["--reliable","--port","7777"])
+        .output().unwrap();
+    assert!(report.status.success());
+    let output=String::from_utf8_lossy(&report.stdout);
+    assert!(output.contains("reliable_flows=1 confirmed=0 outstanding_in_capture=1"));
+    assert!(output.contains("outstanding_client=1 outstanding_server=0"));
+    assert!(output.contains("not proof of network loss"));
+}

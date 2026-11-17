@@ -10,6 +10,7 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use crate::ack::AckRange;
 use crate::legacy_frame::{decode_datagram, Reliability, SplitInfo};
 
 pub const MAX_PCAP_BYTES: usize = 32 * 1024 * 1024;
@@ -58,6 +59,22 @@ pub struct FrameSummary {
     pub payload_bytes: usize,
 }
 
+/// Read-only packet-number evidence. No payload bytes, tokens, cookies,
+/// passwords or client nicknames are stored in this structure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceEvidence {
+    pub sequence: u16,
+    pub reliability: Reliability,
+}
+
+/// All validated ACK ranges and frame sequence numbers from a datagram.
+/// The codec already bounds each datagram to 512 ACK numbers and 32 frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReliableEvidence {
+    pub acknowledgements: Vec<AckRange>,
+    pub sequences: Vec<SequenceEvidence>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UdpEvent {
     pub record: usize,
@@ -67,6 +84,8 @@ pub struct UdpEvent {
     pub destination: SocketAddrV4,
     pub wire_bytes: usize,
     pub kind: FrameKind,
+    /// Present only if this datagram was decoded as a legacy RakNet frame.
+    pub reliable: Option<ReliableEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,12 +280,26 @@ pub fn analyze_pcap(bytes: &[u8], port: Option<u16>) -> Result<CaptureReport, Ca
                     if report.events.len() >= MAX_UDP_EVENTS {
                         return Err(CaptureError::TooManyEvents);
                     }
+                    let kind = classify_udp(udp.payload);
+                    // Never keep the raw payload; only validated wire
+                    // sequence numbers and ACK ranges are retained.
+                    let reliable = if matches!(kind, FrameKind::Reliable { .. }) {
+                        decode_datagram(udp.payload).ok().map(|data| ReliableEvidence {
+                            acknowledgements: data.acknowledgements,
+                            sequences: data.frames.iter().map(|frame| SequenceEvidence {
+                                sequence: frame.sequence,
+                                reliability: frame.reliability,
+                            }).collect(),
+                        })
+                    } else {
+                        None
+                    };
                     report.events.push(UdpEvent {
                         record: report.records,
                         seconds, fraction,
                         source: udp.src, destination: udp.dst,
                         wire_bytes: udp.payload.len(),
-                        kind: classify_udp(udp.payload),
+                        kind, reliable,
                     });
                 }
             }
@@ -360,6 +393,33 @@ mod tests {
         assert_eq!((ack_ranges,frames),(1,1));
         assert_eq!(first.unwrap().sequence,8);
         assert_eq!(rep.events[0].source.port(),45000);
+        let evidence=rep.events[3].reliable.as_ref().expect("evidence");
+        assert_eq!(evidence.acknowledgements,[AckRange{start:1,end:1}]);
+        assert_eq!(evidence.sequences,[SequenceEvidence {
+            sequence:8,reliability:Reliability::Reliable,
+        }]);
+        assert!(rep.events[0].reliable.is_none());
+    }
+
+    #[test]
+    fn keeps_all_sequence_ids_and_acks_without_any_raw_payload() {
+        let mut pcap=header(false,false,1);
+        let frames=[
+            Frame{sequence:9,reliability:Reliability::Reliable,ordering:None,
+                payload_bits:8,payload:vec![0x61],split:None},
+            Frame{sequence:10,reliability:Reliability::Unreliable,ordering:None,
+                payload_bits:8,payload:vec![0x62],split:None},
+            Frame{sequence:11,reliability:Reliability::Reliable,ordering:None,
+                payload_bits:8,payload:vec![0x63],split:None},
+        ];
+        let wire=encode_datagram(&[5,6,9],&frames).unwrap();
+        add_record(&mut pcap,&ethernet(&ipv4_udp(&wire,0),0),false);
+        let report=analyze_pcap(&pcap,Some(7777)).unwrap();
+        let ev=report.events[0].reliable.as_ref().unwrap();
+        assert_eq!(ev.acknowledgements,[AckRange{start:5,end:6},AckRange{start:9,end:9}]);
+        assert_eq!(ev.sequences.iter().map(|x|x.sequence).collect::<Vec<_>>(),
+            vec![9,10,11]);
+        assert!(!format!("{report:?}").contains("password-secret"));
     }
 
     #[test]

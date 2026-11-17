@@ -14,3 +14,6 @@ pub mod capture;
 
 /// Offline handshake timeline analysis (metadata only).
 pub mod handshake_trace;
+
+/// Reliable frame/ACK correlation within a capture (no raw payload).
+pub mod reliable_trace;

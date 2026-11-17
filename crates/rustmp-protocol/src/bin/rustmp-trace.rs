@@ -11,10 +11,11 @@ use rustmp_protocol::capture::{
     analyze_pcap, FrameKind, TimestampResolution, MAX_PCAP_BYTES,
 };
 use rustmp_protocol::handshake_trace::analyze_offline_flows;
+use rustmp_protocol::reliable_trace::analyze_reliable_flows;
 
 fn usage() {
     println!("RUSTMP trace inspector (classic .pcap only, read-only)");
-    println!("Usage: rustmp-trace <trace.pcap> [--port N] [--show-endpoints] [--handshakes]");
+    println!("Usage: rustmp-trace <trace.pcap> [--port N] [--show-endpoints] [--handshakes] [--reliable]");
     println!("       rustmp-trace --help");
     println!("Default: endpoint IP addresses and all payload bytes are hidden.");
     println!("Only unencrypted SA-MP Query / RakNet offline and frame metadata are recognized.");
@@ -30,12 +31,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut port: Option<u16> = None;
     let mut show_endpoints = false;
     let mut show_handshakes = false;
+    let mut show_reliable = false;
     let mut args=env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => { usage(); return Ok(()); }
             "--show-endpoints" => { show_endpoints = true; }
             "--handshakes" => { show_handshakes = true; }
+            "--reliable" => { show_reliable = true; }
             "--port" => {
                 if port.is_some() {return Err("--port must be supplied only once".into());}
                 port = Some(args.next().ok_or("--port requires a UDP port")?.parse::<u16>()?);
@@ -50,6 +53,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if show_handshakes && port.is_none() {
         return Err("--handshakes requires --port N to identify the server endpoint".into());
+    }
+    if show_reliable && port.is_none() {
+        return Err("--reliable requires --port N to identify the server endpoint".into());
     }
     let file = path.ok_or("missing .pcap path; try --help")?;
     let path = Path::new(&file);
@@ -114,6 +120,29 @@ reliability={:?} ordered={:?} split={:?} payload_bytes={}",
                 f.timestamp_order_issues);
         }
         println!("NOTICE: a missing reply may be caused by packet loss, capture loss or filtering.");
+    }
+    if show_reliable {
+        let server_port=port.expect("checked above");
+        let analysis=analyze_reliable_flows(&report,server_port)
+            .map_err(|error|format!("reliable trace: {error:?}"))?;
+        let outstanding:usize=analysis.flows.iter()
+            .map(|flow|flow.outstanding_client+flow.outstanding_server).sum();
+        let confirmed:usize=analysis.flows.iter()
+            .map(|flow|flow.client_confirmed+flow.server_confirmed).sum();
+        println!("RELIABLE TRACE (observed wire IDs; no game authentication)");
+        println!("reliable_flows={} confirmed={} outstanding_in_capture={} ignored={}",
+            analysis.flows.len(),confirmed,outstanding,analysis.ignored_events);
+        for (index,flow) in analysis.flows.iter().enumerate() {
+            println!("reliable_flow={} {} -> {} records={}..{} client_frames={} server_frames={} client_confirmed={} server_confirmed={} client_repeated={} server_repeated={} outstanding_client={} outstanding_server={} unmatched_acks={} untracked={}",
+                index+1,display_port(flow.client,show_endpoints),
+                display_port(flow.server,show_endpoints),
+                flow.first_record,flow.last_record,flow.client_frames,
+                flow.server_frames,flow.client_confirmed,flow.server_confirmed,
+                flow.client_retransmissions,flow.server_retransmissions,
+                flow.outstanding_client,flow.outstanding_server,
+                flow.unmatched_acks,flow.untracked_frames);
+        }
+        println!("NOTICE: outstanding_in_capture is not proof of network loss, and unmatched ACKs may refer to frames outside the capture.");
     }
     Ok(())
 }
