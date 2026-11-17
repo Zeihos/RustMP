@@ -10,8 +10,8 @@ if errorlevel 1 (
 echo [CHECK] cargo check --locked --workspace --all-targets
 cargo check --locked --workspace --all-targets
 if errorlevel 1 goto failed
-echo [TEST] cargo test --locked --workspace
-cargo test --locked --workspace
+echo [TEST] cargo test --locked --workspace --all-targets
+cargo test --locked --workspace --all-targets
 if errorlevel 1 goto failed
 echo [OK] Workspace checks and tests passed.
 pause

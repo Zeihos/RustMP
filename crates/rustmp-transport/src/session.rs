@@ -59,13 +59,14 @@ pub struct IngestResult {
     pub duplicates: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OrderingChannel {
     expected: u16,
     pending: BTreeMap<u16, DeliveredMessage>,
     last_sequenced: Option<u16>,
 }
 
+#[derive(Clone)]
 struct VerifiedSession {
     last_activity: Instant,
     receive: ReceiveWindow,
@@ -230,26 +231,33 @@ impl VerifiedSessions {
         Ok(session.resend.track_sent(bytes, now)?)
     }
 
-    /// Atomically decode the whole datagram before updating a verified peer.
-    /// Rejects all unknown sources before parsing. This deliberately does
-    /// NOT authenticate packets or imply that actual client login works.
+    /// Apply a full datagram transactionally. Previously a late invalid
+    /// frame could fail after earlier frames consumed ACKs, receive sequence
+    /// numbers or split/ordering queue capacity. A bounded copy of the peer
+    /// state is now committed only once every frame has succeeded.
+    ///
+    /// This is a correctness-first library implementation; cloning per-peer
+    /// state costs memory/CPU and should be profiled before production use.
+    /// The live UDP server never admits VerifiedSessions as game players.
     pub fn ingest(&mut self, peer: SocketAddr, bytes: &[u8], now: Instant)
         -> Result<IngestResult, SessionError>
     {
-        if !self.peers.contains_key(&peer) { return Err(SessionError::UnknownPeer); }
+        let current = self.peers.get(&peer).ok_or(SessionError::UnknownPeer)?;
         let packet = decode_datagram(bytes)?;
-        let session = self.peers.get_mut(&peer).ok_or(SessionError::UnknownPeer)?;
+        let mut pending = current.clone();
         let mut output = IngestResult::default();
-        // ACK range decoding validates total expansion before any removal.
+        // Work exclusively against the private candidate; any error leaves
+        // the original ACK queue, receive window and fragment state intact.
         for range in packet.acknowledgements {
             for number in range.start..=range.end {
-                if session.resend.acknowledge(number) { output.newly_acknowledged += 1; }
+                if pending.resend.acknowledge(number) { output.newly_acknowledged += 1; }
             }
         }
         for frame in packet.frames {
-            session.apply_decoded_frame(frame, now, &mut output)?;
+            pending.apply_decoded_frame(frame, now, &mut output)?;
         }
-        session.last_activity = now;
+        pending.last_activity = now;
+        self.peers.insert(peer, pending);
         Ok(output)
     }
 
@@ -376,6 +384,55 @@ mod tests {
         assert!(s.ingest(peer(7),truncated,now).is_err());
         assert_eq!(s.pending_reliable_count(peer(7)),Some(1));
         assert_eq!(s.pending_ack_count(peer(7)),Some(0));
+    }
+
+    #[test]
+    fn later_invalid_frame_rolls_back_ack_receive_window_and_delivery() {
+        let now = Instant::now();
+        let addr = peer(7000);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        sessions.track_sent(addr, b"server_response", now).unwrap();
+
+        let first = frame(0, Reliability::Reliable, None, b"first");
+        // Encodable on the wire, but unacceptable to the bounded ordered
+        // delivery queue: index 129 is farther than its limit of 128.
+        let invalid = frame(1, Reliability::ReliableOrdered,
+            Some((0, (MAX_ORDERED_QUEUE_ITEMS + 1) as u16)), b"late");
+        let combined = encode_datagram(&[0], &[first.clone(), invalid]).unwrap();
+
+        assert_eq!(sessions.ingest(addr, &combined, now),
+            Err(SessionError::OrderedBacklog));
+        // Neither the valid first frame nor the piggyback ACK was committed.
+        assert_eq!(sessions.pending_reliable_count(addr), Some(1));
+        assert_eq!(sessions.pending_ack_count(addr), Some(0));
+
+        let correct = encode_datagram(&[0], &[first]).unwrap();
+        let delivered = sessions.ingest(addr, &correct, now).unwrap();
+        assert_eq!(delivered.newly_acknowledged, 1);
+        assert_eq!(delivered.duplicates, 0);
+        assert_eq!(delivered.delivered.len(), 1);
+        assert_eq!(delivered.delivered[0].payload, b"first");
+        assert_eq!(sessions.pending_reliable_count(addr), Some(0));
+        assert_eq!(sessions.pending_ack_count(addr), Some(1));
+    }
+
+    #[test]
+    fn invalid_ordered_frame_does_not_change_last_activity_or_expire_window() {
+        let now = Instant::now();
+        let addr = peer(7001);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        let failing = encode_datagram(&[], &[frame(
+            0, Reliability::ReliableOrdered,
+            Some((1, (MAX_ORDERED_QUEUE_ITEMS + 1) as u16)), b"too-far",
+        )]).unwrap();
+        let later = now + Duration::from_secs(50);
+        assert_eq!(sessions.ingest(addr, &failing, later),
+            Err(SessionError::OrderedBacklog));
+        assert_eq!(sessions.pending_ack_count(addr), Some(0));
+        // A failed packet cannot artificially keep an idle session alive.
+        assert_eq!(sessions.cleanup(now + SESSION_IDLE_TIMEOUT), 1);
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub struct RetryBatch {
 
 /// Per-peer reliable send bookkeeping. A separate verified wire codec is
 /// responsible for serializing packets and decoding acknowledgements.
+#[derive(Clone)]
 pub struct OutboundReliability {
     next_sequence: u16,
     outstanding: BTreeMap<u16, Outstanding>,
@@ -166,6 +167,7 @@ pub enum ReceiveDecision {
 }
 
 /// Bounded sliding window for 16-bit sequence numbers, including wraparound.
+#[derive(Clone)]
 pub struct ReceiveWindow {
     next_expected: u16,
     seen: [bool; RECEIVE_WINDOW],
@@ -202,7 +204,7 @@ impl ReceiveWindow {
 }
 
 /// ACK message numbers pending serialization. Does not represent a wire frame.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PendingAcks {
     entries: BTreeSet<u16>,
 }

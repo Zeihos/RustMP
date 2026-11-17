@@ -434,6 +434,14 @@ mod tests {
     }
 
     #[test]
+    fn default_server_configuration_binds_only_to_loopback() {
+        let default = Config::default();
+        assert_eq!(default.bind, "127.0.0.1");
+        let parsed = parse_options(&[]).unwrap().unwrap();
+        assert_eq!(parsed.bind, "127.0.0.1");
+    }
+
+    #[test]
     fn experimental_bind_and_cli_are_explicit() {
         let opts: Vec<_>=["--bind","127.0.0.1","--experimental-preauth"].iter()
             .map(|s|s.to_string()).collect();

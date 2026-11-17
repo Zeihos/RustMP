@@ -29,6 +29,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo build files
         uses: Swatinem/rust-cache@v2
+      - name: Set up Python for repository check
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate public repository hygiene
+        run: python scripts/check_repo.py
+
       - name: Check all workspace targets
         run: cargo check --locked --workspace --all-targets
       - name: Test all workspace targets

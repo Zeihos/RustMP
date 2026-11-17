@@ -41,6 +41,7 @@ pub struct ReassembledMessage {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct SplitGroup {
     created: Instant,
     reliability: Reliability,
@@ -50,7 +51,7 @@ struct SplitGroup {
     bytes: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SplitAssembler {
     groups: HashMap<u16, SplitGroup>,
     buffered_bytes: usize,
