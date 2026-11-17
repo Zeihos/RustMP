@@ -115,6 +115,11 @@ def check() -> list[str]:
 
 
 def main() -> int:
+    # Windows GitHub Actions can default to cp1252 even for UTF-8 files.
+    # Use UTF-8 for diagnostic messages on every supported platform.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     errors = check()
     if errors:
         print(f"[FAIL] Найдено проблем: {len(errors)}", file=sys.stderr)
