@@ -22,3 +22,6 @@ jobs:
 
       - name: Check server command-line entry point
         run: cargo run --locked -p rustmp-server -- --help
+
+      - name: Check offline PCAP inspector entry point
+        run: cargo run --locked -p rustmp-protocol --bin rustmp-trace -- --help

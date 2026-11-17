@@ -6,5 +6,8 @@ pub mod query;
 
 pub mod ack;
 
-/// Bounded codec for the non-split legacy RakNet datagram wire format.
+/// Bounded codec for legacy RakNet datagrams and split headers.
 pub mod legacy_frame;
+
+/// Privacy-conscious classic PCAP/UDP capture inspector (no payload logging).
+pub mod capture;

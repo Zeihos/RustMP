@@ -1,5 +1,15 @@
 # История изменений
 
+## 0.2.0-alpha.16 — 2026-11-17
+
+- Добавлена библиотека rustmp-protocol::capture для bounded-анализа классических PCAP с ограничениями размера файла, записей и числа событий.
+- Поддерживаются little/big endian и micro/nanosecond timestamps, Ethernet/VLAN, RAW IPv4, BSD loopback и Linux cooked v1/v2; только полные IPv4 UDP пакеты.
+- Классификация SA-MP Query, известных RakNet offline пакетов SA-MP/open.mp и распознаваемых ACK/frames без печати payload.
+- Новый CLI rustmp-trace с --port и opt-in --show-endpoints: IP-адреса по умолчанию скрыты.
+- Unit-тесты с синтетическими PCAP и black-box тесты бинарного анализатора: приватность, фильтрация и ошибки формата.
+- Инструкция TRACE_ANALYSIS.md. Реальные клиентские захваты отсутствуют; полноценное подключение SA-MP/open.mp не подтверждено.
+
+
 ## 0.2.0-alpha.15 — 2026-11-09
 
 - Ограничена память таблицы per-IP SA-MP Query: максимум 1024 отслеживаемых адреса, новые источники отклоняются при заполнении до периодической очистки.
