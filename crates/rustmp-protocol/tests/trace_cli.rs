@@ -86,3 +86,66 @@ fn binary_rejects_bad_magic_and_has_help() {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("PCAPNG"));
 }
+
+
+fn two_way_open_capture() -> Vec<u8> {
+    let mut combined=test_capture(&[24,0,0]);
+    let mut server_reply=test_capture(&[25,0]);
+    let ip=24+16+14;
+    // Reverse the IPv4 endpoints and UDP ports of the server reply.
+    server_reply[ip+12..ip+16].copy_from_slice(&[192,0,2,11]);
+    server_reply[ip+16..ip+20].copy_from_slice(&[192,0,2,10]);
+    server_reply[ip+20..ip+22].copy_from_slice(&7777u16.to_be_bytes());
+    server_reply[ip+22..ip+24].copy_from_slice(&45000u16.to_be_bytes());
+    combined.extend_from_slice(&server_reply[24..]);
+    combined
+}
+
+#[test]
+fn offline_handshake_timeline_correlates_both_directions_without_exposing_ips() {
+    let fixture=TempCapture::write(&two_way_open_capture());
+    let out=Command::new(env!("CARGO_BIN_EXE_rustmp-trace"))
+        .arg(&fixture.0)
+        .args(["--port","7777","--handshakes"])
+        .output().unwrap();
+    assert!(out.status.success(), "{}",String::from_utf8_lossy(&out.stderr));
+    let text=String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("handshake_flows=1 repeated_requests=0 without_reply_in_capture=0"));
+    assert!(text.contains("profile=open.mp state=OfflineReplyObserved"));
+    assert!(text.contains("IP-hidden:45000 -> IP-hidden:7777"));
+    assert!(!text.contains("192.0.2.10"));
+    assert!(!text.contains("192.0.2.11"));
+}
+
+#[test]
+fn repeated_request_without_reply_is_reported_as_capture_observation_only() {
+    let mut capture=test_capture(&[16,0,0]);
+    let second=test_capture(&[16,0,0]);
+    capture.extend_from_slice(&second[24..]);
+    let fixture=TempCapture::write(&capture);
+    let out=Command::new(env!("CARGO_BIN_EXE_rustmp-trace"))
+        .arg(&fixture.0)
+        .args(["--port","7777","--handshakes"])
+        .output().unwrap();
+    assert!(out.status.success());
+    let text=String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("handshake_flows=1 repeated_requests=1 without_reply_in_capture=1"));
+    assert!(text.contains("state=AwaitingReply"));
+    assert!(text.contains("missing reply may be caused"));
+}
+
+#[test]
+fn flow_analysis_needs_explicit_server_port_and_endpoints_are_opt_in() {
+    let fixture=TempCapture::write(&two_way_open_capture());
+    let binary=env!("CARGO_BIN_EXE_rustmp-trace");
+    let denied=Command::new(binary).arg(&fixture.0)
+        .arg("--handshakes").output().unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires --port"));
+    let allowed=Command::new(binary).arg(&fixture.0)
+        .args(["--handshakes","--port","7777","--show-endpoints"])
+        .output().unwrap();
+    assert!(allowed.status.success());
+    assert!(String::from_utf8_lossy(&allowed.stdout)
+        .contains("192.0.2.10:45000 -> 192.0.2.11:7777"));
+}

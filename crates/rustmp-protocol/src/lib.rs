@@ -11,3 +11,6 @@ pub mod legacy_frame;
 
 /// Privacy-conscious classic PCAP/UDP capture inspector (no payload logging).
 pub mod capture;
+
+/// Offline handshake timeline analysis (metadata only).
+pub mod handshake_trace;

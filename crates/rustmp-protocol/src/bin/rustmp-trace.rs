@@ -10,10 +10,11 @@ use std::path::Path;
 use rustmp_protocol::capture::{
     analyze_pcap, FrameKind, TimestampResolution, MAX_PCAP_BYTES,
 };
+use rustmp_protocol::handshake_trace::analyze_offline_flows;
 
 fn usage() {
     println!("RUSTMP trace inspector (classic .pcap only, read-only)");
-    println!("Usage: rustmp-trace <trace.pcap> [--port N] [--show-endpoints]");
+    println!("Usage: rustmp-trace <trace.pcap> [--port N] [--show-endpoints] [--handshakes]");
     println!("       rustmp-trace --help");
     println!("Default: endpoint IP addresses and all payload bytes are hidden.");
     println!("Only unencrypted SA-MP Query / RakNet offline and frame metadata are recognized.");
@@ -28,11 +29,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut path: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut show_endpoints = false;
+    let mut show_handshakes = false;
     let mut args=env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => { usage(); return Ok(()); }
             "--show-endpoints" => { show_endpoints = true; }
+            "--handshakes" => { show_handshakes = true; }
             "--port" => {
                 if port.is_some() {return Err("--port must be supplied only once".into());}
                 port = Some(args.next().ok_or("--port requires a UDP port")?.parse::<u16>()?);
@@ -44,6 +47,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+    }
+    if show_handshakes && port.is_none() {
+        return Err("--handshakes requires --port N to identify the server endpoint".into());
     }
     let file = path.ok_or("missing .pcap path; try --help")?;
     let path = Path::new(&file);
@@ -62,7 +68,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         TimestampResolution::Microseconds => 6,
         TimestampResolution::Nanoseconds => 9,
     };
-    for event in report.events {
+    for event in &report.events {
         let description=match event.kind {
             FrameKind::Query {opcode} => {
                 let code = if opcode.is_ascii_graphic() {char::from(opcode)} else {'?'};
@@ -87,6 +93,27 @@ reliability={:?} ordered={:?} split={:?} payload_bytes={}",
             display_port(event.source,show_endpoints),
             display_port(event.destination,show_endpoints),
             event.wire_bytes,description,width=precision);
+    }
+    if show_handshakes {
+        let server_port=port.expect("checked above");
+        let flows=analyze_offline_flows(&report,server_port)
+            .map_err(|e|format!("handshake timeline: {e:?}"))?;
+        let repeated:usize=flows.flows.iter().map(|f|f.repeated_requests).sum();
+        let missing=flows.flows.iter().filter(|f|f.missing_reply_in_capture()).count();
+        println!("HANDSHAKE TIMELINE (observed offline packets, NOT authenticated clients)");
+        println!("handshake_flows={} repeated_requests={} without_reply_in_capture={} skipped={}",
+            flows.flows.len(),repeated,missing,flows.skipped_events);
+        for (i,f) in flows.flows.iter().enumerate() {
+            println!("flow={} {} -> {} profile={} state={:?} records={}..{} requests={} cookie_challenges={} open_replies={} repeated={} after_reply={} orphan_challenges={} orphan_replies={} timestamp_anomalies={}",
+                i+1,display_port(f.client,show_endpoints),
+                display_port(f.server,show_endpoints),
+                f.profile,f.state,f.first_record,f.last_record,
+                f.requests,f.cookie_challenges,f.open_replies,
+                f.repeated_requests,f.retries_after_reply,
+                f.challenges_before_request,f.replies_before_request,
+                f.timestamp_order_issues);
+        }
+        println!("NOTICE: a missing reply may be caused by packet loss, capture loss or filtering.");
     }
     Ok(())
 }

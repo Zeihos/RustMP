@@ -1,5 +1,15 @@
 # История изменений
 
+## 0.2.0-alpha.17 — 2026-11-17
+
+- Реализован offline handshake trace correlator в rustmp-protocol::handshake_trace: формирование временной линии по двум SocketAddrV4 и профилю.
+- Режим rustmp-trace --handshakes --port N показывает запросы, cookie challenges, open replies, дубли, повторы после ответа, orphan reply/challenge и порядок timestamps.
+- Состояния AwaitingReply, OfflineReplyObserved, OrphanChallenge и OrphanReply описывают только наблюдения внутри PCAP, не реальную авторизацию.
+- Ограничено количество отслеживаемых потоков до 2048; IP скрываются по умолчанию, raw payload в отчётах не сохраняется.
+- Добавлены unit-тесты привязки к IP/порту, профилям, orphan-пакетов, повторов и лимита памяти, а также CLI-интеграционные тесты двухстороннего захвата.
+- Реальных клиентских дампов пока нет; совместимость настоящего SA-MP/open.mp клиента не объявляется.
+
+
 ## 0.2.0-alpha.16 — 2026-11-17
 
 - Добавлена библиотека rustmp-protocol::capture для bounded-анализа классических PCAP с ограничениями размера файла, записей и числа событий.
