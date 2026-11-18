@@ -1,16 +1,23 @@
 //! Black-box tests run the actual rustmp-server executable, not just
 //! the in-process dispatcher. This catches missing main.rs integration.
-use std::io;
+use std::io::{self, Read};
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 use rustmp_protocol::legacy_frame::{decode_datagram, encode_datagram, Frame, Reliability};
 
+/// Serialize black-box server startups. Parallel tests used to race on
+/// ephemeral port reservation; a second UDP socket could claim the released
+/// server port before its child started listening.
+static SERVER_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
 struct LocalProcess {
     child: Child,
     address: SocketAddr,
+    _guard: MutexGuard<'static, ()>,
 }
 impl Drop for LocalProcess {
     fn drop(&mut self) {
@@ -19,17 +26,24 @@ impl Drop for LocalProcess {
     }
 }
 impl LocalProcess {
-    fn start(experimental: bool) -> Self {
-        // Reserve an ephemeral loopback port, then give it to the child.
+    fn start(experimental: bool) -> (Self, UdpSocket) {
+        let guard=SERVER_PROCESS_LOCK.lock().unwrap_or_else(|poisoned|
+            poisoned.into_inner());
+        // Bind the test client WHILE the server port is reserved, ensuring
+        // that the kernel cannot assign the same UDP port to both sockets.
+        // The lock also prevents another test in this binary from racing on
+        // the brief reserve/drop/startup interval.
         let hold = UdpSocket::bind("127.0.0.1:0").unwrap();
         let address = hold.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_ne!(client.local_addr().unwrap(), address);
         drop(hold);
         let mut command = Command::new(env!("CARGO_BIN_EXE_rustmp-server"));
         command.args(["--bind","127.0.0.1","--port",&address.port().to_string()]);
         if experimental { command.arg("--experimental-preauth"); }
-        let child = command.stdout(Stdio::null()).stderr(Stdio::null())
+        let child = command.stdout(Stdio::null()).stderr(Stdio::piped())
             .spawn().expect("spawn compiled RUSTMP binary");
-        Self { child, address }
+        (Self { child, address, _guard:guard }, client)
     }
 
     fn first_reply(&mut self, client: &UdpSocket, data: &[u8]) -> Vec<u8> {
@@ -37,7 +51,11 @@ impl LocalProcess {
         client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         for _ in 0..50 {
             if let Some(exit) = self.child.try_wait().unwrap() {
-                panic!("RUSTMP exited unexpectedly: {exit}");
+                let mut diagnostics=String::new();
+                if let Some(stderr)=self.child.stderr.as_mut() {
+                    let _=stderr.read_to_string(&mut diagnostics);
+                }
+                panic!("RUSTMP exited unexpectedly: {exit}; stderr: {diagnostics}");
             }
             client.send_to(data,self.address).unwrap();
             match client.recv_from(&mut buf) {
@@ -69,8 +87,7 @@ fn reliable(sequence:u16,payload:&[u8],acks:&[u16])->Vec<u8> {
 
 #[test]
 fn actual_binary_reliable_samp_transport_probe() {
-    let mut server=LocalProcess::start(true);
-    let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut server,client)=LocalProcess::start(true);
     assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
 
     client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -94,8 +111,7 @@ fn actual_binary_reliable_samp_transport_probe() {
 
 #[test]
 fn actual_binary_cookie_open_reply_retransmission_and_port_isolation() {
-    let mut server=LocalProcess::start(true);
-    let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut server,client)=LocalProcess::start(true);
     let challenge=server.first_reply(&client,&[24,0,0]);
     assert_eq!(challenge.len(),3);
     assert_eq!(challenge[0],26);
@@ -118,8 +134,7 @@ fn actual_binary_cookie_open_reply_retransmission_and_port_isolation() {
 
 #[test]
 fn default_binary_does_not_complete_a_reliable_handshake() {
-    let mut server=LocalProcess::start(false);
-    let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut server,client)=LocalProcess::start(false);
     assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
     client.set_read_timeout(Some(Duration::from_millis(350))).unwrap();
     client.send_to(&reliable(0,&[8],&[]),server.address).unwrap();
@@ -147,8 +162,7 @@ fn production_binding_is_rejected_before_opening_public_diagnostic_socket() {
 
 #[test]
 fn malformed_udp_flood_does_not_break_next_legitimate_probe() {
-    let mut server=LocalProcess::start(true);
-    let client=UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut server,client)=LocalProcess::start(true);
     assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
 
     // The diagnostic transport must ignore oversized or nonsensical input
