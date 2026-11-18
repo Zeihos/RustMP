@@ -129,20 +129,26 @@ reliability={:?} ordered={:?} split={:?} payload_bytes={}",
             .map(|flow|flow.outstanding_client+flow.outstanding_server).sum();
         let confirmed:usize=analysis.flows.iter()
             .map(|flow|flow.client_confirmed+flow.server_confirmed).sum();
+        let repeated_acks:usize=analysis.flows.iter()
+            .map(|flow|flow.repeated_acks).sum();
+        let reused_after_ack:usize=analysis.flows.iter()
+            .map(|flow|flow.client_reused_after_ack+flow.server_reused_after_ack).sum();
         println!("RELIABLE TRACE (observed wire IDs; no game authentication)");
-        println!("reliable_flows={} confirmed={} outstanding_in_capture={} ignored={}",
-            analysis.flows.len(),confirmed,outstanding,analysis.ignored_events);
+        println!("reliable_flows={} confirmed={} outstanding_in_capture={} ignored={} repeated_acks={} reused_after_ack={}",
+            analysis.flows.len(),confirmed,outstanding,analysis.ignored_events,
+            repeated_acks,reused_after_ack);
         for (index,flow) in analysis.flows.iter().enumerate() {
-            println!("reliable_flow={} {} -> {} records={}..{} client_frames={} server_frames={} client_confirmed={} server_confirmed={} client_repeated={} server_repeated={} outstanding_client={} outstanding_server={} unmatched_acks={} untracked={}",
+            println!("reliable_flow={} {} -> {} records={}..{} client_frames={} server_frames={} client_confirmed={} server_confirmed={} client_repeated={} server_repeated={} client_reused_after_ack={} server_reused_after_ack={} outstanding_client={} outstanding_server={} unmatched_acks={} repeated_acks={} untracked={}",
                 index+1,display_port(flow.client,show_endpoints),
                 display_port(flow.server,show_endpoints),
                 flow.first_record,flow.last_record,flow.client_frames,
                 flow.server_frames,flow.client_confirmed,flow.server_confirmed,
                 flow.client_retransmissions,flow.server_retransmissions,
+                flow.client_reused_after_ack,flow.server_reused_after_ack,
                 flow.outstanding_client,flow.outstanding_server,
-                flow.unmatched_acks,flow.untracked_frames);
+                flow.unmatched_acks,flow.repeated_acks,flow.untracked_frames);
         }
-        println!("NOTICE: outstanding_in_capture is not proof of network loss, and unmatched ACKs may refer to frames outside the capture.");
+        println!("NOTICE: outstanding_in_capture is not proof of network loss; reused_after_ack may indicate a retransmission OR a new session reusing the same ID; unmatched ACKs may refer to frames outside the capture.");
     }
     Ok(())
 }

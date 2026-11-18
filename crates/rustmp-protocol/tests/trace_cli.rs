@@ -221,3 +221,32 @@ fn reliable_cli_reports_unobserved_ack_and_rejects_ambiguous_server_port() {
     assert!(output.contains("outstanding_client=1 outstanding_server=0"));
     assert!(output.contains("not proof of network loss"));
 }
+
+
+#[test]
+fn reliable_cli_distinguishes_post_ack_reuse_and_repeated_ack() {
+    use rustmp_protocol::legacy_frame::encode_datagram;
+    let first=encode_datagram(&[],&[reliable_frame(21,b"original-private-data")]).unwrap();
+    let ack=encode_datagram(&[21],&[]).unwrap();
+    let after_ack=encode_datagram(&[],&[reliable_frame(21,b"possible-retransmit")]).unwrap();
+    let mut capture=test_capture(&first);
+    append_capture_record(&mut capture,&ack,true);
+    append_capture_record(&mut capture,&after_ack,false);
+    append_capture_record(&mut capture,&ack,true);
+
+    let fixture=TempCapture::write(&capture);
+    let out=Command::new(env!("CARGO_BIN_EXE_rustmp-trace"))
+        .arg(&fixture.0)
+        .args(["--reliable","--port","7777"])
+        .output().unwrap();
+    assert!(out.status.success(), "{}",String::from_utf8_lossy(&out.stderr));
+    let text=String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("reliable_flows=1 confirmed=1 outstanding_in_capture=0"));
+    assert!(text.contains("repeated_acks=1 reused_after_ack=1"));
+    assert!(text.contains("client_reused_after_ack=1 server_reused_after_ack=0"));
+    assert!(text.contains("client_repeated=0 server_repeated=0"));
+    assert!(text.contains("unmatched_acks=0 repeated_acks=1"));
+    assert!(!text.contains("original-private-data"));
+    assert!(!text.contains("possible-retransmit"));
+    assert!(!text.contains("192.0.2.10"));
+}

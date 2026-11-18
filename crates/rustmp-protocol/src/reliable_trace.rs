@@ -6,7 +6,7 @@
 //! capture filters, delayed ACKs or because this is a synthetic protocol.
 //! No client identity or authentication state is inferred from socket address.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddrV4;
 
 use crate::capture::{CaptureReport, ReliableEvidence, UdpEvent};
@@ -16,6 +16,10 @@ pub const MAX_RELIABLE_FLOWS: usize = 1024;
 /// Per direction; do not allocate an unbounded sequence history for traffic
 /// with no ACKs. Values beyond the cap are reported as untracked.
 pub const MAX_PENDING_SEQUENCES: usize = 512;
+/// Recently acknowledged IDs remembered separately for each direction.
+/// Only metadata is stored. After eviction, reuse/duplicate classification
+/// becomes uncertain; never infer client sessions or packet loss from it.
+pub const MAX_RECENT_ACKNOWLEDGEMENTS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReliableTraceError {
@@ -33,10 +37,17 @@ pub struct ReliableFlow {
     pub server_frames: usize,
     pub client_retransmissions: usize,
     pub server_retransmissions: usize,
+    /// Reliable IDs observed AGAIN after their ACK was captured. Could also
+    /// represent legitimate reuse or a new session with the same endpoints.
+    pub client_reused_after_ack: usize,
+    pub server_reused_after_ack: usize,
     pub client_confirmed: usize,
     pub server_confirmed: usize,
     /// ACK sequence numbers with no matching outstanding frame IN THIS CAPTURE.
     pub unmatched_acks: usize,
+    /// ACKs for sequences already acknowledged in this capture's bounded
+    /// history (different from ACKs with no observed sender).
+    pub repeated_acks: usize,
     pub outstanding_client: usize,
     pub outstanding_server: usize,
     /// New sequences omitted from tracking due to the bounded memory limit.
@@ -49,8 +60,10 @@ impl ReliableFlow {
             client, server, first_record: record, last_record: record,
             client_frames: 0, server_frames: 0,
             client_retransmissions: 0, server_retransmissions: 0,
+            client_reused_after_ack: 0, server_reused_after_ack: 0,
             client_confirmed: 0, server_confirmed: 0,
-            unmatched_acks: 0, outstanding_client: 0, outstanding_server: 0,
+            unmatched_acks: 0, repeated_acks: 0,
+            outstanding_client: 0, outstanding_server: 0,
             untracked_frames: 0,
         }
     }
@@ -63,10 +76,39 @@ pub struct ReliableTraceReport {
     pub ignored_events: usize,
 }
 
+/// Most recently acknowledged message numbers, in observed ACK order.
+/// Pending and confirmed message numbers are intentionally separate:
+/// retransmits after acknowledgement must not create a second pending entry.
+#[derive(Default)]
+struct AckHistory {
+    remembered: BTreeSet<u16>,
+    oldest_first: VecDeque<u16>,
+}
+
+impl AckHistory {
+    fn contains(&self, seq: u16) -> bool {
+        self.remembered.contains(&seq)
+    }
+
+    fn remember(&mut self, seq: u16) {
+        if !self.remembered.insert(seq) {
+            return;
+        }
+        self.oldest_first.push_back(seq);
+        if self.oldest_first.len() > MAX_RECENT_ACKNOWLEDGEMENTS {
+            if let Some(old) = self.oldest_first.pop_front() {
+                self.remembered.remove(&old);
+            }
+        }
+    }
+}
+
 struct Tracker {
     summary: ReliableFlow,
     pending_client: BTreeSet<u16>,
     pending_server: BTreeSet<u16>,
+    acknowledged_client: AckHistory,
+    acknowledged_server: AckHistory,
 }
 
 impl Tracker {
@@ -75,50 +117,80 @@ impl Tracker {
             summary: ReliableFlow::new(client, server, n),
             pending_client: BTreeSet::new(),
             pending_server: BTreeSet::new(),
+            acknowledged_client: AckHistory::default(),
+            acknowledged_server: AckHistory::default(),
         }
     }
 
     fn record(&mut self, observed: &ReliableEvidence, to_server: bool) {
         // ACKs on the client->server path acknowledge server-originated
         // reliable sequences, and vice versa. Range expansion is bounded
-        // by the existing RakNet ACK codec (512 sequence numbers).
-        let (opposite, confirmed) = if to_server {
-            (&mut self.pending_server, &mut self.summary.server_confirmed)
+        // by the legacy ACK decoder (at most 512 sequence numbers).
+        let (opposite, history) = if to_server {
+            (&mut self.pending_server, &mut self.acknowledged_server)
         } else {
-            (&mut self.pending_client, &mut self.summary.client_confirmed)
+            (&mut self.pending_client, &mut self.acknowledged_client)
         };
+        let mut new_acks = 0usize;
+        let mut repeated_acks = 0usize;
+        let mut unmatched_acks = 0usize;
         for range in &observed.acknowledgements {
             for seq in range.start..=range.end {
                 if opposite.remove(&seq) {
-                    *confirmed += 1;
+                    history.remember(seq);
+                    new_acks += 1;
+                } else if history.contains(seq) {
+                    repeated_acks += 1;
                 } else {
-                    self.summary.unmatched_acks += 1;
+                    unmatched_acks += 1;
                 }
             }
         }
-
-        let (pending, frames, repeats) = if to_server {
-            (&mut self.pending_client,
-             &mut self.summary.client_frames,
-             &mut self.summary.client_retransmissions)
+        if to_server {
+            self.summary.server_confirmed += new_acks;
         } else {
-            (&mut self.pending_server,
-             &mut self.summary.server_frames,
-             &mut self.summary.server_retransmissions)
+            self.summary.client_confirmed += new_acks;
+        }
+        self.summary.repeated_acks += repeated_acks;
+        self.summary.unmatched_acks += unmatched_acks;
+
+        let (pending, history) = if to_server {
+            (&mut self.pending_client, &self.acknowledged_client)
+        } else {
+            (&mut self.pending_server, &self.acknowledged_server)
         };
+        let mut frames = 0usize;
+        let mut retransmissions = 0usize;
+        let mut after_ack = 0usize;
+        let mut untracked = 0usize;
         for frame in &observed.sequences {
             if !frame.reliability.is_reliable() {
                 continue;
             }
-            *frames += 1;
+            frames += 1;
             if pending.contains(&frame.sequence) {
-                *repeats += 1;
+                retransmissions += 1;
+            } else if history.contains(frame.sequence) {
+                // Do not re-open an already ACKed sequence. An identical ID
+                // could also be a new session/reuse after wrap; the report
+                // deliberately avoids claiming an actual retransmission.
+                after_ack += 1;
             } else if pending.len() >= MAX_PENDING_SEQUENCES {
-                self.summary.untracked_frames += 1;
+                untracked += 1;
             } else {
                 pending.insert(frame.sequence);
             }
         }
+        if to_server {
+            self.summary.client_frames += frames;
+            self.summary.client_retransmissions += retransmissions;
+            self.summary.client_reused_after_ack += after_ack;
+        } else {
+            self.summary.server_frames += frames;
+            self.summary.server_retransmissions += retransmissions;
+            self.summary.server_reused_after_ack += after_ack;
+        }
+        self.summary.untracked_frames += untracked;
     }
 }
 
@@ -285,6 +357,62 @@ mod tests {
         ]),7777).unwrap();
         assert_eq!(result.flows[0].unmatched_acks,2);
         assert_eq!(result.flows[0].outstanding_client,0);
+    }
+
+    #[test]
+    fn acked_message_reappearing_does_not_reopen_outstanding_and_repeated_ack_is_known() {
+        let (c,s)=(addr(1,51000),addr(2,7777));
+        let rel=Reliability::Reliable;
+        let result=analyze_reliable_flows(&report(vec![
+            record(1,c,s,&[(17,rel)],&[]),
+            record(2,s,c,&[],&[17]),
+            record(3,c,s,&[(17,rel)],&[]),
+            record(4,s,c,&[],&[17]),
+        ]),7777).unwrap();
+        let f=&result.flows[0];
+        assert_eq!(f.client_frames,2);
+        assert_eq!(f.client_confirmed,1);
+        assert_eq!(f.client_retransmissions,0);
+        assert_eq!(f.client_reused_after_ack,1);
+        assert_eq!(f.repeated_acks,1);
+        assert_eq!(f.unmatched_acks,0);
+        assert_eq!(f.outstanding_client,0);
+    }
+
+    #[test]
+    fn acknowledgements_and_reuse_are_direction_specific() {
+        let (c,s)=(addr(1,51001),addr(2,7777));
+        let rel=Reliability::Reliable;
+        let result=analyze_reliable_flows(&report(vec![
+            record(1,c,s,&[(4,rel)],&[]),
+            record(2,s,c,&[(4,rel)],&[4]),
+            record(3,c,s,&[(4,rel)],&[4]),
+            record(4,s,c,&[(4,rel)],&[4]),
+        ]),7777).unwrap();
+        let f=&result.flows[0];
+        assert_eq!(f.client_confirmed,1);
+        assert_eq!(f.server_confirmed,1);
+        assert_eq!(f.client_reused_after_ack,1);
+        assert_eq!(f.server_reused_after_ack,1);
+        assert_eq!(f.repeated_acks,1);
+        assert_eq!(f.outstanding_client,0);
+        assert_eq!(f.outstanding_server,0);
+    }
+
+    #[test]
+    fn recent_ack_history_is_bounded_and_old_ids_cannot_force_memory_growth() {
+        let mut h=AckHistory::default();
+        for seq in 0..(MAX_RECENT_ACKNOWLEDGEMENTS as u16+25) {
+            h.remember(seq);
+        }
+        assert_eq!(h.oldest_first.len(),MAX_RECENT_ACKNOWLEDGEMENTS);
+        assert_eq!(h.remembered.len(),MAX_RECENT_ACKNOWLEDGEMENTS);
+        assert!(!h.contains(0));
+        assert!(!h.contains(24));
+        assert!(h.contains(25));
+        assert!(h.contains(MAX_RECENT_ACKNOWLEDGEMENTS as u16+24));
+        h.remember(25); // Duplicates must not extend retention or grow state.
+        assert_eq!(h.oldest_first.len(),MAX_RECENT_ACKNOWLEDGEMENTS);
     }
 
     #[test]
