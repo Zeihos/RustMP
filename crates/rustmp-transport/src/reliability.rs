@@ -139,9 +139,18 @@ impl OutboundReliability {
     pub fn poll_retries(&mut self, now: Instant, limit: usize) -> RetryBatch {
         let mut batch = RetryBatch::default();
         if limit == 0 { return batch; }
-        for (&seq, entry) in self.outstanding.iter_mut() {
-            if batch.resend.len() + batch.abandoned.len() >= limit { break; }
-            if now.saturating_duration_since(entry.last_sent) < self.retry_after { continue; }
+        // Sequence-number iteration alone can starve newer messages when
+        // per-tick budget is smaller than the number of overdue packets:
+        // the low-numbered messages become due again and win each poll.
+        // Visit the oldest last-sent timestamps first, then break ties by ID.
+        let mut due: Vec<_> = self.outstanding.iter()
+            .filter(|(_, entry)|
+                now.saturating_duration_since(entry.last_sent) >= self.retry_after)
+            .map(|(&seq, entry)| (entry.last_sent, seq)).collect();
+        due.sort_unstable();
+        for (_, seq) in due.into_iter().take(limit) {
+            let entry = self.outstanding.get_mut(&seq)
+                .expect("scheduled sequence exists");
             if entry.retries >= self.max_retries {
                 batch.abandoned.push(seq);
                 continue;
@@ -358,6 +367,44 @@ mod tests {
             vec![Resend { sequence: 0, bytes: b"hello".to_vec(), attempt: 1 }]);
         assert_eq!(q.poll_retries(t + Duration::from_millis(200), 2).resend[0].attempt, 2);
         assert_eq!(q.poll_retries(t + Duration::from_millis(300), 2).abandoned, vec![0]);
+        assert_eq!(q.pending_count(), 0);
+    }
+
+    #[test]
+    fn retry_budget_visits_oldest_unsent_messages_before_repeating_head() {
+        let start = Instant::now();
+        let mut q = OutboundReliability::new(Duration::from_millis(100), 5);
+        for _ in 0..9 {
+            q.track_sent(b"payload", start).unwrap();
+        }
+        let first = q.poll_retries(start + Duration::from_millis(100), 3);
+        assert_eq!(first.resend.iter().map(|x|x.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2]);
+        let second = q.poll_retries(start + Duration::from_millis(200), 3);
+        assert_eq!(second.resend.iter().map(|x|x.sequence).collect::<Vec<_>>(),
+            vec![3, 4, 5]);
+        let third = q.poll_retries(start + Duration::from_millis(300), 3);
+        assert_eq!(third.resend.iter().map(|x|x.sequence).collect::<Vec<_>>(),
+            vec![6, 7, 8]);
+        assert_eq!(q.pending_count(), 9);
+    }
+
+    #[test]
+    fn retry_budget_chooses_exhausted_oldest_for_abandonment() {
+        let start = Instant::now();
+        let mut q = OutboundReliability::new(Duration::from_millis(100), 1);
+        q.track_sent(b"old", start).unwrap();
+        q.track_sent(b"new", start + Duration::from_millis(1)).unwrap();
+        let first = q.poll_retries(start + Duration::from_millis(100), 1);
+        assert_eq!(first.resend[0].sequence, 0);
+        // #1 is still older than the retried #0, so #1 goes first.
+        let second = q.poll_retries(start + Duration::from_millis(101), 1);
+        assert_eq!(second.resend[0].sequence, 1);
+        let third = q.poll_retries(start + Duration::from_millis(200), 1);
+        assert_eq!(third.abandoned, vec![0]);
+        assert_eq!(q.pending_count(), 1);
+        let fourth = q.poll_retries(start + Duration::from_millis(201), 1);
+        assert_eq!(fourth.abandoned, vec![1]);
         assert_eq!(q.pending_count(), 0);
     }
 

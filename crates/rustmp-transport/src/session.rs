@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use rustmp_protocol::ack::encode_ack_prefix;
-use rustmp_protocol::legacy_frame::{decode_datagram, Frame, FrameError, Reliability};
+use rustmp_protocol::legacy_frame::{decode_datagram, encode_datagram, Frame, FrameError, Reliability};
 use crate::fragments::{SplitAssembler, SplitError, MAX_GROUP_BYTES};
 use crate::reliability::{
     OutboundReliability, PendingAcks, ReceiveDecision, ReceiveWindow, ReliabilityError,
@@ -23,6 +23,10 @@ pub const MAX_ORDERED_QUEUE_BYTES: usize = 128 * 1024;
 pub const MAX_ORDERED_QUEUE_ITEMS: usize = 128;
 pub const MAX_DATAGRAM_EVENTS: usize = 32;
 pub const ACKS_PER_FLUSH: usize = 64;
+/// Per scheduler invocation, regardless of the number of verified sessions.
+pub const MAX_SESSION_RETRIES_PER_POLL: usize = 64;
+/// One sender cannot consume the entire retry budget.
+pub const MAX_SESSION_RETRIES_PER_PEER: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionError {
@@ -57,6 +61,22 @@ pub struct IngestResult {
     pub delivered: Vec<DeliveredMessage>,
     pub newly_acknowledged: usize,
     pub duplicates: usize,
+}
+
+/// An encoded reliable retry destined for the exact explicitly verified
+/// endpoint. The caller must still actually send the UDP datagram.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionRetryDatagram {
+    pub peer: SocketAddr,
+    pub sequence: u16,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SessionRetryBatch {
+    pub packets: Vec<SessionRetryDatagram>,
+    /// Entire sessions dropped when any reliable message exhausts retries.
+    pub disconnected: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +202,8 @@ impl VerifiedSession {
 #[derive(Default)]
 pub struct VerifiedSessions {
     peers: HashMap<SocketAddr, VerifiedSession>,
+    /// Resume index into the sorted address snapshot for fair global budgets.
+    retry_cursor: usize,
 }
 
 impl VerifiedSessions {
@@ -229,6 +251,72 @@ impl VerifiedSessions {
     {
         let session = self.peers.get_mut(&peer).ok_or(SessionError::UnknownPeer)?;
         Ok(session.resend.track_sent(bytes, now)?)
+    }
+
+    /// Schedule bounded reliable retransmissions for explicitly verified peers.
+    ///
+    /// This method DOES NOT admit clients, send sockets, authenticate messages
+    /// or connect to the live experimental server. The external transport
+    /// must send returned packets and retire disconnected endpoints.
+    ///
+    /// Work is transactional across the entire scheduler invocation: a wire
+    /// encoding error does not consume retries or silently lose datagrams.
+    /// A peer with exhausted reliable messages is disconnected (rather than
+    /// emitting a partial response which can never complete).
+    pub fn poll_retries(&mut self, now: Instant)
+        -> Result<SessionRetryBatch, SessionError>
+    {
+        let mut addrs: Vec<_> = self.peers.keys().copied().collect();
+        if addrs.is_empty() {
+            self.retry_cursor = 0;
+            return Ok(SessionRetryBatch::default());
+        }
+        addrs.sort_unstable();
+        let start = self.retry_cursor % addrs.len();
+        let mut visited = 0usize;
+        let mut staged: Vec<(SocketAddr, OutboundReliability)> = Vec::new();
+        let mut result = SessionRetryBatch::default();
+
+        for offset in 0..addrs.len() {
+            if result.packets.len() >= MAX_SESSION_RETRIES_PER_POLL { break; }
+            visited += 1;
+            let peer = addrs[(start + offset) % addrs.len()];
+            let Some(session) = self.peers.get(&peer) else { continue };
+            let remaining = MAX_SESSION_RETRIES_PER_POLL - result.packets.len();
+            let mut outbound = session.resend.clone();
+            let due = outbound.poll_retries(
+                now, remaining.min(MAX_SESSION_RETRIES_PER_PEER));
+            if !due.abandoned.is_empty() {
+                result.disconnected.push(peer);
+                continue;
+            }
+            for resend in due.resend {
+                let frame = Frame {
+                    sequence: resend.sequence,
+                    reliability: Reliability::Reliable,
+                    ordering: None,
+                    payload_bits: (resend.bytes.len() * 8) as u16,
+                    payload: resend.bytes,
+                    split: None,
+                };
+                let bytes = encode_datagram(&[], &[frame])?;
+                result.packets.push(SessionRetryDatagram {
+                    peer, sequence: resend.sequence, bytes,
+                });
+            }
+            staged.push((peer, outbound));
+        }
+
+        for (peer, outbound) in staged {
+            if let Some(session) = self.peers.get_mut(&peer) {
+                session.resend = outbound;
+            }
+        }
+        for peer in &result.disconnected {
+            self.peers.remove(peer);
+        }
+        self.retry_cursor = (start + visited) % addrs.len();
+        Ok(result)
     }
 
     /// Apply a full datagram transactionally. Previously a late invalid
@@ -433,6 +521,115 @@ mod tests {
         assert_eq!(sessions.pending_ack_count(addr), Some(0));
         // A failed packet cannot artificially keep an idle session alive.
         assert_eq!(sessions.cleanup(now + SESSION_IDLE_TIMEOUT), 1);
+    }
+
+    #[test]
+    fn verified_retry_encodes_same_sequence_and_ack_stops_future_retries() {
+        let now = Instant::now();
+        let addr = peer(7300);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        assert_eq!(sessions.track_sent(addr, b"reliable-response", now), Ok(0));
+        assert!(sessions.poll_retries(now + Duration::from_millis(249))
+            .unwrap().packets.is_empty());
+        let result = sessions.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert!(result.disconnected.is_empty());
+        assert_eq!(result.packets.len(), 1);
+        assert_eq!(result.packets[0].peer, addr);
+        assert_eq!(result.packets[0].sequence, 0);
+        let decoded = decode_datagram(&result.packets[0].bytes).unwrap();
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].sequence, 0);
+        assert_eq!(decoded.frames[0].payload, b"reliable-response");
+        let ack = encode_datagram(&[0], &[]).unwrap();
+        assert_eq!(sessions.ingest(addr, &ack, now + Duration::from_millis(260))
+            .unwrap().newly_acknowledged, 1);
+        assert_eq!(sessions.pending_reliable_count(addr), Some(0));
+        assert!(sessions.poll_retries(now + Duration::from_secs(1))
+            .unwrap().packets.is_empty());
+    }
+
+    #[test]
+    fn verified_retry_global_limit_rotates_across_more_than_64_peers() {
+        use std::collections::HashSet;
+        let now = Instant::now();
+        let mut sessions = VerifiedSessions::new();
+        let count = MAX_SESSION_RETRIES_PER_POLL + 8;
+        for n in 0..count {
+            let addr = peer(13000 + n as u16);
+            sessions.admit_verified(addr, now).unwrap();
+            sessions.track_sent(addr, b"ping", now).unwrap();
+        }
+        let first = sessions.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert_eq!(first.packets.len(), MAX_SESSION_RETRIES_PER_POLL);
+        assert_eq!(first.packets.iter().map(|x|x.peer).collect::<HashSet<_>>().len(),
+            MAX_SESSION_RETRIES_PER_POLL);
+        let second = sessions.poll_retries(now + Duration::from_millis(500)).unwrap();
+        assert_eq!(second.packets.len(), MAX_SESSION_RETRIES_PER_POLL);
+        let seen: HashSet<_> = first.packets.iter().chain(second.packets.iter())
+            .map(|p|p.peer).collect();
+        assert_eq!(seen.len(), count);
+        assert_eq!(sessions.len(), count);
+        assert!(first.disconnected.is_empty() && second.disconnected.is_empty());
+    }
+
+    #[test]
+    fn verified_retry_per_peer_budget_prioritizes_unretried_messages() {
+        let now = Instant::now();
+        let addr = peer(7301);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        for _ in 0..10 {
+            sessions.track_sent(addr, b"payload", now).unwrap();
+        }
+        let first = sessions.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert_eq!(first.packets.iter().map(|p|p.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]);
+        let second = sessions.poll_retries(now + Duration::from_millis(500)).unwrap();
+        assert_eq!(second.packets.iter().map(|p|p.sequence).collect::<Vec<_>>(),
+            vec![4, 5, 6, 7]);
+        let third = sessions.poll_retries(now + Duration::from_millis(750)).unwrap();
+        assert_eq!(third.packets.iter().map(|p|p.sequence).collect::<Vec<_>>(),
+            vec![8, 9, 0, 1]);
+        assert_eq!(sessions.pending_reliable_count(addr), Some(10));
+    }
+
+    #[test]
+    fn exhausted_verified_session_disconnects_without_starving_other_peer() {
+        let now = Instant::now();
+        let exhausted = peer(7302);
+        let fresh = peer(7303);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(exhausted, now).unwrap();
+        sessions.track_sent(exhausted, b"abandoned", now).unwrap();
+        for attempt in 1..=5 {
+            let batch = sessions.poll_retries(now + Duration::from_millis(250*attempt))
+                .unwrap();
+            assert_eq!(batch.packets.len(), 1);
+            assert!(batch.disconnected.is_empty());
+        }
+        sessions.admit_verified(fresh, now + Duration::from_millis(1250)).unwrap();
+        sessions.track_sent(fresh, b"new", now + Duration::from_millis(1250)).unwrap();
+        let batch = sessions.poll_retries(now + Duration::from_millis(1500)).unwrap();
+        assert_eq!(batch.disconnected, vec![exhausted]);
+        assert_eq!(batch.packets.len(), 1);
+        assert_eq!(batch.packets[0].peer, fresh);
+        assert!(!sessions.contains(exhausted));
+        assert!(sessions.contains(fresh));
+    }
+
+    #[test]
+    fn retry_scheduler_does_not_refresh_peer_idle_lifetime() {
+        let now = Instant::now();
+        let addr = peer(7304);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        sessions.track_sent(addr, b"unacked", now).unwrap();
+        assert_eq!(sessions.poll_retries(now + Duration::from_millis(250))
+            .unwrap().packets.len(), 1);
+        assert_eq!(sessions.cleanup(now + SESSION_IDLE_TIMEOUT), 1);
+        assert!(sessions.poll_retries(now + SESSION_IDLE_TIMEOUT)
+            .unwrap().packets.is_empty());
     }
 
     #[test]
