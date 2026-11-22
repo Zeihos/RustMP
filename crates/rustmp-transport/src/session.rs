@@ -36,6 +36,8 @@ pub enum SessionError {
     Reliability(ReliabilityError),
     Split(SplitError),
     OrderedBacklog,
+    /// The endpoint was disconnected and re-admitted after ACK preparation.
+    StaleAckBatch,
 }
 
 impl From<FrameError> for SessionError {
@@ -79,6 +81,23 @@ pub struct SessionRetryBatch {
     pub disconnected: Vec<SocketAddr>,
 }
 
+/// An immutable ACK packet prepared for an explicitly verified endpoint.
+/// Only call confirm_acks_sent AFTER send_to has successfully sent these bytes.
+/// Dropping the batch after an I/O failure leaves all ACKs queued.
+#[derive(Debug)]
+pub struct PreparedAckBatch {
+    peer: SocketAddr,
+    generation: u64,
+    numbers: Vec<u16>,
+    bytes: Vec<u8>,
+}
+
+impl PreparedAckBatch {
+    pub fn peer(&self) -> SocketAddr { self.peer }
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn count(&self) -> usize { self.numbers.len() }
+}
+
 #[derive(Clone, Default)]
 struct OrderingChannel {
     expected: u16,
@@ -88,6 +107,7 @@ struct OrderingChannel {
 
 #[derive(Clone)]
 struct VerifiedSession {
+    generation: u64,
     last_activity: Instant,
     receive: ReceiveWindow,
     resend: OutboundReliability,
@@ -99,8 +119,9 @@ struct VerifiedSession {
 }
 
 impl VerifiedSession {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, generation: u64) -> Self {
         Self {
+            generation,
             last_activity: now,
             receive: ReceiveWindow::default(),
             resend: OutboundReliability::new(Duration::from_millis(250), 5),
@@ -218,6 +239,8 @@ fn encode_reliable_payload(sequence: u16, payload: &[u8]) -> Result<Vec<u8>, Fra
 #[derive(Default)]
 pub struct VerifiedSessions {
     peers: HashMap<SocketAddr, VerifiedSession>,
+    /// Never reuse a session generation for the same endpoint in this registry.
+    next_generation: u64,
     /// Resume index into the sorted address snapshot for fair global budgets.
     retry_cursor: usize,
 }
@@ -232,7 +255,9 @@ impl VerifiedSessions {
     pub fn admit_verified(&mut self, peer: SocketAddr, now: Instant) -> Result<bool, SessionError> {
         if self.peers.contains_key(&peer) { return Ok(false); }
         if self.peers.len() >= MAX_SESSIONS { return Err(SessionError::LimitReached); }
-        self.peers.insert(peer, VerifiedSession::new(now));
+        let generation = self.next_generation.checked_add(1).ok_or(SessionError::LimitReached)?;
+        self.peers.insert(peer, VerifiedSession::new(now, generation));
+        self.next_generation = generation;
         Ok(true)
     }
 
@@ -381,8 +406,40 @@ impl VerifiedSessions {
         Ok(output)
     }
 
-    /// Serialize buffered ACKs. These should be emitted only by a verified
-    /// session transport. On encode failure, keep queued ACKs unchanged.
+    /// Prepare at most ACKS_PER_FLUSH ACKs without consuming any of them.
+    /// A network sender should call socket.send_to(batch.bytes(), batch.peer())
+    /// and then confirm_acks_sent(batch) ONLY after successful sending.
+    /// If the send fails, drop the batch and prepare it again later.
+    /// This does not authenticate the peer or send any UDP by itself.
+    pub fn prepare_ack_batch(&self, peer: SocketAddr)
+        -> Result<Option<PreparedAckBatch>, SessionError>
+    {
+        let session = self.peers.get(&peer).ok_or(SessionError::UnknownPeer)?;
+        if session.pending_acks.is_empty() { return Ok(None); }
+        let mut snapshot = session.pending_acks.clone();
+        let numbers = snapshot.take(ACKS_PER_FLUSH);
+        let bytes = encode_ack_prefix(&numbers)
+            .map_err(|e| SessionError::Malformed(FrameError::Ack(e)))?.bytes;
+        Ok(Some(PreparedAckBatch {
+            peer, generation: session.generation, numbers, bytes,
+        }))
+    }
+
+    /// Commit only the ACK numbers in a successfully sent batch. A packet
+    /// prepared before a disconnect/re-admission must never clear ACKs from
+    /// a new session using the same UDP source address.
+    pub fn confirm_acks_sent(&mut self, batch: PreparedAckBatch)
+        -> Result<usize, SessionError>
+    {
+        let session = self.peers.get_mut(&batch.peer).ok_or(SessionError::StaleAckBatch)?;
+        if session.generation != batch.generation { return Err(SessionError::StaleAckBatch); }
+        Ok(session.pending_acks.discard(&batch.numbers))
+    }
+
+    /// Legacy eager ACK drain, retained for existing diagnostic callers.
+    /// It consumes ACKs before socket send. New integrations should use
+    /// prepare_ack_batch + confirm_acks_sent so I/O failures retain ACKs.
+    /// On encode failure, the queued ACKs remain unchanged.
     pub fn take_ack_prefix(&mut self, peer: SocketAddr) -> Result<Option<Vec<u8>>, SessionError> {
         let session = self.peers.get_mut(&peer).ok_or(SessionError::UnknownPeer)?;
         if session.pending_acks.is_empty() { return Ok(None); }
@@ -596,6 +653,94 @@ mod tests {
         assert_eq!(decode_datagram(&b_ack).unwrap().acknowledgements,
             vec![rustmp_protocol::ack::AckRange { start: 0, end: 0 }]);
         assert_eq!(sessions.pending_ack_count(b), Some(0));
+    }
+
+
+    #[test]
+    fn prepared_ack_survives_failed_send_and_commits_only_its_own_numbers() {
+        let now = Instant::now();
+        let addr = peer(7360);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(addr, now).unwrap();
+        for sequence in 0..70u16 {
+            let incoming = encode_datagram(&[], &[
+                frame(sequence, Reliability::Reliable, None, b"sample")
+            ]).unwrap();
+            sessions.ingest(addr, &incoming, now).unwrap();
+        }
+        let failed_send = sessions.prepare_ack_batch(addr).unwrap().unwrap();
+        assert_eq!(failed_send.count(), ACKS_PER_FLUSH);
+        assert_eq!(sessions.pending_ack_count(addr), Some(70));
+        // Simulate an external socket error by abandoning, not confirming.
+        drop(failed_send);
+        let ready = sessions.prepare_ack_batch(addr).unwrap().unwrap();
+        assert_eq!(ready.count(), ACKS_PER_FLUSH);
+        assert_eq!(decode_datagram(ready.bytes()).unwrap().acknowledgements,
+            vec![rustmp_protocol::ack::AckRange { start: 0, end: 63 }]);
+
+        for sequence in 70..72u16 {
+            let incoming = encode_datagram(&[], &[
+                frame(sequence, Reliability::Reliable, None, b"new")
+            ]).unwrap();
+            sessions.ingest(addr, &incoming, now).unwrap();
+        }
+        assert_eq!(sessions.confirm_acks_sent(ready), Ok(64));
+        assert_eq!(sessions.pending_ack_count(addr), Some(8));
+        let rest = sessions.prepare_ack_batch(addr).unwrap().unwrap();
+        assert_eq!(decode_datagram(rest.bytes()).unwrap().acknowledgements,
+            vec![rustmp_protocol::ack::AckRange { start: 64, end: 71 }]);
+        assert_eq!(sessions.confirm_acks_sent(rest), Ok(8));
+        assert_eq!(sessions.prepare_ack_batch(addr).unwrap().is_none(), true);
+    }
+
+    #[test]
+    fn ack_batch_cannot_clear_a_reconnected_peer_or_a_different_peer() {
+        let now = Instant::now();
+        let a = peer(7361);
+        let b = peer(7362);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(a, now).unwrap();
+        sessions.admit_verified(b, now).unwrap();
+        let raw = encode_datagram(&[], &[frame(0, Reliability::Reliable, None, b"hi")]).unwrap();
+        sessions.ingest(a, &raw, now).unwrap();
+        sessions.ingest(b, &raw, now).unwrap();
+        let obsolete = sessions.prepare_ack_batch(a).unwrap().unwrap();
+        assert_eq!(sessions.pending_ack_count(b), Some(1));
+        assert!(sessions.disconnect(a));
+        sessions.admit_verified(a, now).unwrap();
+        sessions.ingest(a, &raw, now).unwrap();
+        assert_eq!(sessions.confirm_acks_sent(obsolete), Err(SessionError::StaleAckBatch));
+        assert_eq!(sessions.pending_ack_count(a), Some(1));
+        assert_eq!(sessions.pending_ack_count(b), Some(1));
+        let fresh = sessions.prepare_ack_batch(a).unwrap().unwrap();
+        assert_eq!(sessions.confirm_acks_sent(fresh), Ok(1));
+        assert_eq!(sessions.pending_ack_count(b), Some(1));
+    }
+
+    #[test]
+    fn prepared_ack_can_be_sent_over_loopback_udp_before_commit() {
+        use std::net::UdpSocket;
+        let now = Instant::now();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let peer_addr = receiver.local_addr().unwrap();
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(peer_addr, now).unwrap();
+        let incoming = encode_datagram(&[], &[
+            frame(0, Reliability::Reliable, None, b"udp")
+        ]).unwrap();
+        sessions.ingest(peer_addr, &incoming, now).unwrap();
+
+        let prepared = sessions.prepare_ack_batch(peer_addr).unwrap().unwrap();
+        assert_eq!(sender.send_to(prepared.bytes(), prepared.peer()).unwrap(), prepared.bytes().len());
+        let mut received = [0u8; 256];
+        let (len, source) = receiver.recv_from(&mut received).unwrap();
+        assert_eq!(source, sender.local_addr().unwrap());
+        assert_eq!(&received[..len], prepared.bytes());
+        assert_eq!(sessions.pending_ack_count(peer_addr), Some(1));
+        assert_eq!(sessions.confirm_acks_sent(prepared), Ok(1));
+        assert_eq!(sessions.pending_ack_count(peer_addr), Some(0));
     }
 
     #[test]
