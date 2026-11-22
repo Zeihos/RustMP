@@ -16,6 +16,36 @@ use rustmp_transport::{LegacyWireProfile, OfflineGateway};
 
 const BEGINS_PER_IP_PER_SECOND: u16 = 4;
 const MAX_RATE_ENTRIES: usize = 1024;
+/// Short-lived ACK replay, only for completed localhost diagnostic sessions.
+const COMPLETED_ACK_TTL: Duration = Duration::from_secs(3);
+const MAX_COMPLETED_ACKS: usize = 128;
+
+/// An exact final reliable handshake message and its previous ACK-only reply.
+/// Never stores game sessions or grants any authenticated player privileges.
+struct CompletedAck {
+    created: Instant,
+    sequence: u16,
+    payload: Vec<u8>,
+    reply: Vec<u8>,
+}
+
+impl CompletedAck {
+    fn matches(&self, incoming: &[u8], now: Instant) -> bool {
+        if now.saturating_duration_since(self.created) >= COMPLETED_ACK_TTL {
+            return false;
+        }
+        let Ok(datagram) = decode_datagram(incoming) else { return false };
+        if datagram.frames.len() != 1 { return false; }
+        let frame = &datagram.frames[0];
+        frame.sequence == self.sequence
+            && frame.reliability == Reliability::Reliable
+            && frame.ordering.is_none()
+            && frame.split.is_none()
+            && frame.payload_bits == (self.payload.len() * 8) as u16
+            && frame.payload == self.payload
+    }
+}
+
 
 #[derive(Clone, Copy)]
 struct Rate {
@@ -33,6 +63,8 @@ pub struct ProbeStats {
     pub transport_confirmations: u64,
     pub rejected: u64,
     pub throttled: u64,
+    /// Exact final ACKs repeated after a completed localhost handshake.
+    pub completed_ack_replays: u64,
 }
 
 /// No public constructor accepts a configuration switch for open.mp auth.
@@ -44,12 +76,55 @@ pub struct ExperimentalPreAuth {
     rates: HashMap<IpAddr, Rate>,
     stats: ProbeStats,
     next_index: u16,
+    completed_acks: HashMap<SocketAddr, CompletedAck>,
 }
 
 impl ExperimentalPreAuth {
     pub fn new() -> Self { Self::default() }
     pub fn pending_count(&self) -> usize { self.exchange.len() }
     pub fn stats(&self) -> ProbeStats { self.stats }
+    pub fn completed_ack_count(&self) -> usize { self.completed_acks.len() }
+
+    /// A fresh offline open from this same endpoint starts a NEW diagnostic
+    /// attempt. Never allow the old final ACK to mask its new confirmation.
+    /// Called by the dispatcher before the OfflineGateway handles SA-MP open.
+    pub fn on_samp_offline_open(&mut self, peer: SocketAddr) {
+        self.completed_acks.remove(&peer);
+    }
+
+    fn cache_completed_ack(&mut self, incoming: &[u8],
+        outbound: &[Vec<u8>], peer: SocketAddr, now: Instant)
+    {
+        let Ok(packet) = decode_datagram(incoming) else { return };
+        if packet.frames.len() != 1 { return; }
+        let frame = &packet.frames[0];
+        if frame.reliability != Reliability::Reliable
+            || frame.ordering.is_some() || frame.split.is_some()
+            || frame.payload_bits % 8 != 0
+            || frame.payload.is_empty() || frame.payload.len() > 256
+        {
+            return;
+        }
+        let Some(reply) = outbound.iter().find(|bytes| {
+            let Ok(ack) = decode_datagram(bytes) else { return false };
+            ack.frames.is_empty()
+                && ack.acknowledgements.iter().any(|r|
+                    r.start <= frame.sequence && frame.sequence <= r.end)
+        }) else { return };
+        self.completed_acks.retain(|_,v|
+            now.saturating_duration_since(v.created) < COMPLETED_ACK_TTL);
+        if !self.completed_acks.contains_key(&peer)
+            && self.completed_acks.len() >= MAX_COMPLETED_ACKS
+        {
+            // Bounded memory: preserving an existing ACK cache is better
+            // than evicting it because of an unrelated new endpoint.
+            return;
+        }
+        self.completed_acks.insert(peer, CompletedAck {
+            created: now, sequence: frame.sequence,
+            payload: frame.payload.clone(), reply: reply.clone(),
+        });
+    }
 
     /// Intercept open.mp fork's three-byte offline open before OfflineGateway
     /// can allocate any pending slot. This diagnostic token is bound to
@@ -139,6 +214,17 @@ impl ExperimentalPreAuth {
             return Vec::new();
         }
 
+        // If the server's LAST ACK was lost, a client may legitimately retry
+        // the same final frame after its diagnostic exchange was removed.
+        // Only the exact prior source and reliable frame receive its prior
+        // ACK-only reply; never a new game session or transport acceptance.
+        if let Some(saved) = self.completed_acks.get(&peer) {
+            if saved.matches(incoming, now) {
+                self.stats.completed_ack_replays += 1;
+                return vec![saved.reply.clone()];
+            }
+        }
+
         // A known pre-auth peer must never be reset by a repeated initial
         // connection request. ACK deduplication lives in PreAuthExchange.
         if self.exchange.pending_retries(peer).is_some() {
@@ -148,8 +234,10 @@ impl ExperimentalPreAuth {
                         result.outgoing.push(ack);
                     }
                     if result.transport_confirmed {
-                        // Transport transcript completed, but there is no
-                        // game-auth. Free the state without admitting a player.
+                        // Save ONLY an exact ACK-only response briefly.
+                        // This permits a lost final ACK to be retransmitted
+                        // without re-opening pre-auth or admitting players.
+                        self.cache_completed_ack(incoming, &result.outgoing, peer, now);
                         self.exchange.disconnect(peer);
                         offline.release_pending(peer);
                         self.stats.transport_confirmations += 1;
@@ -234,6 +322,8 @@ impl ExperimentalPreAuth {
     pub fn cleanup(&mut self, now: Instant) {
         self.exchange.cleanup(now);
         self.cookie.cleanup(now);
+        self.completed_acks.retain(|_,v|
+            now.saturating_duration_since(v.created) < COMPLETED_ACK_TTL);
         self.rates.retain(|_,rate| now.saturating_duration_since(rate.start) < Duration::from_secs(2));
     }
 }
@@ -490,6 +580,99 @@ mod tests {
         // A second offline request is now able to reuse the released slot.
         assert_eq!(gateway.handle(&[16,0,0],address,
             now+Duration::from_millis(1801)),Some(vec![17,0]));
+    }
+
+    #[test]
+    fn completed_confirmation_replays_only_exact_ack_for_same_peer() {
+        let now=Instant::now();
+        let sender=peer(52500);
+        let mut offline=OfflineGateway::new(5);
+        assert_eq!(offline.handle(&[16,0,0],sender,now),Some(vec![17,0]));
+        let mut router=ExperimentalPreAuth::new();
+        assert_eq!(router.handle(&packet(0,&[8],&[]),sender,peer(7777),
+            &mut offline,b"",now).len(),1);
+        let final_payload=[26,127,0,0,1,0x61,0x1e];
+        let confirmation=packet(1,&final_payload,&[0]);
+        let first=router.handle(&confirmation,sender,peer(7777),
+            &mut offline,b"",now);
+        assert_eq!(first.len(),1);
+        assert_eq!(decode_datagram(&first[0]).unwrap().acknowledgements[0].start,1);
+        assert_eq!(router.pending_count(),0);
+        assert_eq!(offline.pending_count(),0);
+        assert_eq!(router.completed_ack_count(),1);
+
+        // A genuine retransmission can have DIFFERENT piggybacked ACKs.
+        let resent=packet(1,&final_payload,&[]);
+        assert_eq!(router.handle(&resent,sender,peer(7777),
+            &mut offline,b"",now+Duration::from_millis(100)),first);
+        assert_eq!(router.stats().completed_ack_replays,1);
+        assert_eq!(router.stats().transport_confirmations,1);
+        assert_eq!(router.pending_count(),0);
+        assert_eq!(offline.pending_count(),0);
+
+        // Same sequence but modified bytes or another UDP source port must
+        // never inherit a previous client's final handshake ACK.
+        let mut wrong=final_payload;
+        wrong[5]=0x62;
+        assert!(router.handle(&packet(1,&wrong,&[]),sender,peer(7777),
+            &mut offline,b"",now+Duration::from_millis(110)).is_empty());
+        assert!(router.handle(&resent,peer(52501),peer(7777),
+            &mut offline,b"",now+Duration::from_millis(110)).is_empty());
+
+        router.cleanup(now+COMPLETED_ACK_TTL);
+        assert_eq!(router.completed_ack_count(),0);
+        assert!(router.handle(&resent,sender,peer(7777),
+            &mut offline,b"",now+COMPLETED_ACK_TTL).is_empty());
+    }
+
+    #[test]
+    fn new_offline_open_clears_previous_completion_ack_without_new_game_login() {
+        let now=Instant::now();
+        let sender=peer(52510);
+        let mut offline=OfflineGateway::new(5);
+        offline.handle(&[16,0,0],sender,now);
+        let mut router=ExperimentalPreAuth::new();
+        router.handle(&packet(0,&[8],&[]),sender,peer(7777),
+            &mut offline,b"",now);
+        let final_payload=[26,127,0,0,1,0x61,0x1e];
+        let final_wire=packet(1,&final_payload,&[0]);
+        assert_eq!(router.handle(&final_wire,sender,peer(7777),
+            &mut offline,b"",now).len(),1);
+        assert_eq!(router.completed_ack_count(),1);
+        router.on_samp_offline_open(sender);
+        assert_eq!(router.completed_ack_count(),0);
+        assert_eq!(offline.handle(&[16,0,0],sender,now+Duration::from_millis(150)),
+            Some(vec![17,0]));
+        assert!(router.handle(&final_wire,sender,peer(7777),
+            &mut offline,b"",now+Duration::from_millis(150)).is_empty());
+        assert_eq!(router.stats().completed_ack_replays,0);
+        assert_eq!(router.pending_count(),0);
+        assert_eq!(offline.pending_count(),1);
+        // A fresh initial request still starts a NEW diagnostic transcript.
+        assert_eq!(router.handle(&packet(0,&[8],&[]),sender,peer(7777),
+            &mut offline,b"",now+Duration::from_millis(150)).len(),1);
+        assert_eq!(router.pending_count(),1);
+    }
+
+    #[test]
+    fn completion_ack_cache_has_fixed_capacity() {
+        let now=Instant::now();
+        let mut router=ExperimentalPreAuth::new();
+        let final_payload=[26,127,0,0,1,0x61,0x1e];
+        let final_wire=packet(1,&final_payload,&[]);
+        let reply=encode_datagram(&[1],&[]).unwrap();
+        for n in 0..MAX_COMPLETED_ACKS {
+            router.cache_completed_ack(&final_wire,&[reply.clone()],
+                peer(30000+n as u16),now);
+        }
+        assert_eq!(router.completed_ack_count(),MAX_COMPLETED_ACKS);
+        router.cache_completed_ack(&final_wire,&[reply.clone()],peer(50000),now);
+        assert_eq!(router.completed_ack_count(),MAX_COMPLETED_ACKS);
+        router.cleanup(now+COMPLETED_ACK_TTL);
+        assert_eq!(router.completed_ack_count(),0);
+        router.cache_completed_ack(&final_wire,&[reply],peer(50000),
+            now+COMPLETED_ACK_TTL);
+        assert_eq!(router.completed_ack_count(),1);
     }
 
     #[test]

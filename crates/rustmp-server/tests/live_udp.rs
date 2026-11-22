@@ -110,6 +110,45 @@ fn actual_binary_reliable_samp_transport_probe() {
 }
 
 #[test]
+fn actual_binary_resends_lost_final_ack_then_clears_cache_on_new_open() {
+    let (mut server,client)=LocalProcess::start(true);
+    assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
+    let accepted=server.first_reply(&client,&reliable(0,&[8],&[]));
+    let response=decode_datagram(&accepted).unwrap();
+    assert_eq!(response.frames[0].payload.first(),Some(&23));
+
+    let mut final_payload=vec![26u8,127,0,0,1];
+    final_payload.extend_from_slice(&server.address.port().to_le_bytes());
+    let final_wire=reliable(1,&final_payload,&[0]);
+    let first=server.first_reply(&client,&final_wire);
+    let decoded=decode_datagram(&first).unwrap();
+    assert!(decoded.frames.is_empty());
+    assert_eq!(decoded.acknowledgements[0].start,1);
+
+    // Simulate losing the server's final ACK and changing piggybacked ACK
+    // metadata. Exact reliable frame content and endpoint still match.
+    let resent=reliable(1,&final_payload,&[]);
+    let replayed=server.first_reply(&client,&resent);
+    assert_eq!(replayed,first);
+
+    // This starts a new diagnostic attempt with the same UDP source port.
+    // The ACK for the previous completion must no longer be served.
+    assert_eq!(server.first_reply(&client,&[16,0,0]),vec![17,0]);
+    client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    client.send_to(&resent,server.address).unwrap();
+    let mut buf=[0u8;2048];
+    match client.recv_from(&mut buf) {
+        Err(ref err) if err.kind()==io::ErrorKind::TimedOut
+            || err.kind()==io::ErrorKind::WouldBlock => {},
+        reply => panic!("old final ACK was replayed after new offline open: {reply:?}"),
+    }
+    // The newly opened slot can begin a fresh local-only pre-auth probe.
+    let new_accepted=server.first_reply(&client,&reliable(0,&[8],&[]));
+    let decoded=decode_datagram(&new_accepted).unwrap();
+    assert_eq!(decoded.frames[0].payload.first(),Some(&23));
+}
+
+#[test]
 fn actual_binary_cookie_open_reply_retransmission_and_port_isolation() {
     let (mut server,client)=LocalProcess::start(true);
     let challenge=server.first_reply(&client,&[24,0,0]);
