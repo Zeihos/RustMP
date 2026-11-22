@@ -235,6 +235,12 @@ impl PendingAcks {
         for n in &batch { self.entries.remove(n); }
         batch
     }
+
+    /// Remove only the ACK numbers that were actually transmitted.
+    /// Newly queued ACKs remain intact even when a prepared batch was stale.
+    pub fn discard(&mut self, numbers: &[u16]) -> usize {
+        numbers.iter().filter(|&&number| self.entries.remove(&number)).count()
+    }
 }
 
 #[derive(Default)]
