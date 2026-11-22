@@ -197,6 +197,22 @@ impl VerifiedSession {
     }
 }
 
+/// Encode one *unfragmented* reliable datagram. Both first transmissions
+/// and retries use this exact path so the wire framing cannot diverge.
+/// The current library only supports simple Reliable payloads here;
+/// ordered, sequenced and split gameplay frames need separate verified APIs.
+fn encode_reliable_payload(sequence: u16, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+    let frame = Frame {
+        sequence,
+        reliability: Reliability::Reliable,
+        ordering: None,
+        payload_bits: (payload.len() * 8) as u16,
+        payload: payload.to_vec(),
+        split: None,
+    };
+    encode_datagram(&[], &[frame])
+}
+
 /// Registry of *explicitly* verified per-peer states. The live RUSTMP UDP
 /// listener never creates such sessions until a real handshake is implemented.
 #[derive(Default)]
@@ -253,6 +269,30 @@ impl VerifiedSessions {
         Ok(session.resend.track_sent(bytes, now)?)
     }
 
+    /// Stage a new unfragmented reliable datagram and track its original
+    /// sequence number. Returns the exact encoded packet AND destination.
+    ///
+    /// No UDP send occurs here. The caller must deliver the returned bytes,
+    /// and must treat an I/O error as failure to send (the queued message
+    /// remains eligible for the retry scheduler).
+    ///
+    /// The outgoing queue is committed only after validation AND wire
+    /// serialization succeed. Failed/oversized/empty payloads cannot consume
+    /// sequence numbers, occupy the queue or mutate other peer sessions.
+    ///
+    /// This is ONLY for peers admitted by an independent future handshake
+    /// and integrity layer; the live server does not admit real game clients.
+    pub fn queue_reliable(&mut self, peer: SocketAddr, payload: &[u8], now: Instant)
+        -> Result<SessionRetryDatagram, SessionError>
+    {
+        let session = self.peers.get_mut(&peer).ok_or(SessionError::UnknownPeer)?;
+        let mut outgoing = session.resend.clone();
+        let sequence = outgoing.track_sent(payload, now)?;
+        let bytes = encode_reliable_payload(sequence, payload)?;
+        session.resend = outgoing;
+        Ok(SessionRetryDatagram { peer, sequence, bytes })
+    }
+
     /// Schedule bounded reliable retransmissions for explicitly verified peers.
     ///
     /// This method DOES NOT admit clients, send sockets, authenticate messages
@@ -291,15 +331,7 @@ impl VerifiedSessions {
                 continue;
             }
             for resend in due.resend {
-                let frame = Frame {
-                    sequence: resend.sequence,
-                    reliability: Reliability::Reliable,
-                    ordering: None,
-                    payload_bits: (resend.bytes.len() * 8) as u16,
-                    payload: resend.bytes,
-                    split: None,
-                };
-                let bytes = encode_datagram(&[], &[frame])?;
+                let bytes = encode_reliable_payload(resend.sequence, &resend.bytes)?;
                 result.packets.push(SessionRetryDatagram {
                     peer, sequence: resend.sequence, bytes,
                 });
@@ -354,9 +386,14 @@ impl VerifiedSessions {
     pub fn take_ack_prefix(&mut self, peer: SocketAddr) -> Result<Option<Vec<u8>>, SessionError> {
         let session = self.peers.get_mut(&peer).ok_or(SessionError::UnknownPeer)?;
         if session.pending_acks.is_empty() { return Ok(None); }
-        let numbers = session.pending_acks.take(ACKS_PER_FLUSH);
-        // ACKS_PER_FLUSH is always within the codec's upper bound.
-        let encoded = encode_ack_prefix(&numbers).map_err(|e| SessionError::Malformed(FrameError::Ack(e)))?;
+        // Serialize a temporary ACK batch first: even if the codec gains
+        // new validation rules later, a failed encoding cannot drop pending
+        // acknowledgements or move another session's queue.
+        let mut candidate = session.pending_acks.clone();
+        let numbers = candidate.take(ACKS_PER_FLUSH);
+        let encoded = encode_ack_prefix(&numbers)
+            .map_err(|e| SessionError::Malformed(FrameError::Ack(e)))?;
+        session.pending_acks = candidate;
         Ok(Some(encoded.bytes))
     }
 }
@@ -521,6 +558,163 @@ mod tests {
         assert_eq!(sessions.pending_ack_count(addr), Some(0));
         // A failed packet cannot artificially keep an idle session alive.
         assert_eq!(sessions.cleanup(now + SESSION_IDLE_TIMEOUT), 1);
+    }
+
+    #[test]
+    fn ack_flush_is_bounded_and_does_not_consume_other_peers_ack_queue() {
+        let now = Instant::now();
+        let a = peer(7356);
+        let b = peer(7357);
+        let mut sessions = VerifiedSessions::new();
+        sessions.admit_verified(a, now).unwrap();
+        sessions.admit_verified(b, now).unwrap();
+
+        for sequence in 0..70u16 {
+            let datagram = encode_datagram(&[],
+                &[frame(sequence, Reliability::Reliable, None, b"a")]).unwrap();
+            sessions.ingest(a, &datagram, now).unwrap();
+        }
+        let incoming_b = encode_datagram(&[],
+            &[frame(0, Reliability::Reliable, None, b"b")]).unwrap();
+        sessions.ingest(b, &incoming_b, now).unwrap();
+        assert_eq!(sessions.pending_ack_count(a), Some(70));
+        assert_eq!(sessions.pending_ack_count(b), Some(1));
+
+        let first = sessions.take_ack_prefix(a).unwrap().unwrap();
+        assert_eq!(decode_datagram(&first).unwrap().acknowledgements,
+            vec![rustmp_protocol::ack::AckRange { start: 0, end: 63 }]);
+        assert_eq!(sessions.pending_ack_count(a), Some(6));
+        assert_eq!(sessions.pending_ack_count(b), Some(1));
+
+        let second = sessions.take_ack_prefix(a).unwrap().unwrap();
+        assert_eq!(decode_datagram(&second).unwrap().acknowledgements,
+            vec![rustmp_protocol::ack::AckRange { start: 64, end: 69 }]);
+        assert_eq!(sessions.pending_ack_count(a), Some(0));
+        assert_eq!(sessions.take_ack_prefix(a), Ok(None));
+
+        let b_ack = sessions.take_ack_prefix(b).unwrap().unwrap();
+        assert_eq!(decode_datagram(&b_ack).unwrap().acknowledgements,
+            vec![rustmp_protocol::ack::AckRange { start: 0, end: 0 }]);
+        assert_eq!(sessions.pending_ack_count(b), Some(0));
+    }
+
+    #[test]
+    fn queued_first_wire_packet_is_byte_for_byte_identical_to_its_retry() {
+        let now = Instant::now();
+        let sender = peer(7350);
+        let mut s = VerifiedSessions::new();
+        s.admit_verified(sender, now).unwrap();
+
+        let first = s.queue_reliable(sender, b"RUSTMP-original", now).unwrap();
+        assert_eq!(first.peer, sender);
+        assert_eq!(first.sequence, 0);
+        let decoded = decode_datagram(&first.bytes).unwrap();
+        assert_eq!(decoded.acknowledgements.len(), 0);
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].sequence, first.sequence);
+        assert_eq!(decoded.frames[0].reliability, Reliability::Reliable);
+        assert_eq!(decoded.frames[0].payload, b"RUSTMP-original");
+
+        let batch = s.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert_eq!(batch.packets.len(), 1);
+        assert_eq!(batch.packets[0], first);
+        let ack = encode_datagram(&[first.sequence], &[]).unwrap();
+        assert_eq!(s.ingest(sender, &ack, now + Duration::from_millis(251))
+            .unwrap().newly_acknowledged, 1);
+        assert_eq!(s.pending_reliable_count(sender), Some(0));
+        assert!(s.poll_retries(now + Duration::from_millis(1000))
+            .unwrap().packets.is_empty());
+    }
+
+    #[test]
+    fn failed_first_send_validation_does_not_consume_sequence_number() {
+        use crate::reliability::{MAX_MESSAGE_BYTES, ReliabilityError};
+        let now = Instant::now();
+        let sender = peer(7351);
+        let mut s = VerifiedSessions::new();
+        s.admit_verified(sender, now).unwrap();
+
+        assert_eq!(s.queue_reliable(sender, b"", now),
+            Err(SessionError::Reliability(ReliabilityError::EmptyMessage)));
+        assert_eq!(s.queue_reliable(sender, &vec![2u8; MAX_MESSAGE_BYTES + 1], now),
+            Err(SessionError::Reliability(ReliabilityError::OversizedMessage)));
+        assert_eq!(s.pending_reliable_count(sender), Some(0));
+        let first = s.queue_reliable(sender, b"small", now).unwrap();
+        assert_eq!(first.sequence, 0);
+
+        assert_eq!(s.queue_reliable(peer(7352), b"cannot spoof", now),
+            Err(SessionError::UnknownPeer));
+        assert_eq!(s.pending_reliable_count(sender), Some(1));
+        let second = s.queue_reliable(sender, b"next", now).unwrap();
+        assert_eq!(second.sequence, 1);
+    }
+
+    #[test]
+    fn queue_full_refuses_send_without_advancing_sequence_until_ack() {
+        use crate::reliability::{ReliabilityError, MAX_IN_FLIGHT};
+        let now = Instant::now();
+        let sender = peer(7358);
+        let mut s = VerifiedSessions::new();
+        s.admit_verified(sender, now).unwrap();
+        // Legacy bookkeeping is sufficient to populate a bounded queue.
+        for _ in 0..MAX_IN_FLIGHT {
+            s.track_sent(sender, b"pending", now).unwrap();
+        }
+        assert_eq!(s.pending_reliable_count(sender), Some(MAX_IN_FLIGHT));
+        assert_eq!(s.queue_reliable(sender, b"must-not-queue", now),
+            Err(SessionError::Reliability(ReliabilityError::QueueFull)));
+        assert_eq!(s.pending_reliable_count(sender), Some(MAX_IN_FLIGHT));
+
+        let ack = encode_datagram(&[0], &[]).unwrap();
+        assert_eq!(s.ingest(sender, &ack, now).unwrap().newly_acknowledged, 1);
+        let next = s.queue_reliable(sender, b"admitted", now).unwrap();
+        assert_eq!(next.sequence, MAX_IN_FLIGHT as u16);
+        assert_eq!(decode_datagram(&next.bytes).unwrap().frames[0].payload,
+            b"admitted");
+        assert_eq!(s.pending_reliable_count(sender), Some(MAX_IN_FLIGHT));
+    }
+
+    #[test]
+    fn queued_packet_maximum_payload_fits_bounded_wire_codec() {
+        use crate::reliability::MAX_MESSAGE_BYTES;
+        let now = Instant::now();
+        let sender = peer(7353);
+        let mut s = VerifiedSessions::new();
+        s.admit_verified(sender, now).unwrap();
+
+        let bytes = vec![0xABu8; MAX_MESSAGE_BYTES];
+        let first = s.queue_reliable(sender, &bytes, now).unwrap();
+        assert!(first.bytes.len() <= rustmp_protocol::legacy_frame::MAX_DATAGRAM_BYTES);
+        assert_eq!(decode_datagram(&first.bytes).unwrap().frames[0].payload, bytes);
+        let retry = s.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert_eq!(retry.packets, vec![first]);
+    }
+
+    #[test]
+    fn multiple_peers_have_separate_initial_sequences_and_retry_destinations() {
+        let now = Instant::now();
+        let alice = peer(7354);
+        let bob = peer(7355);
+        let mut s = VerifiedSessions::new();
+        s.admit_verified(alice, now).unwrap();
+        s.admit_verified(bob, now).unwrap();
+
+        let a0 = s.queue_reliable(alice, b"alice", now).unwrap();
+        let b0 = s.queue_reliable(bob, b"bob", now).unwrap();
+        let a1 = s.queue_reliable(alice, b"second", now).unwrap();
+        assert_eq!((a0.sequence, b0.sequence, a1.sequence), (0, 0, 1));
+
+        let retry = s.poll_retries(now + Duration::from_millis(250)).unwrap();
+        assert_eq!(retry.packets.len(), 3);
+        for packet in &retry.packets {
+            assert!([alice, bob].contains(&packet.peer));
+            let frame = &decode_datagram(&packet.bytes).unwrap().frames[0];
+            let reference = if packet.peer == bob { &b0 }
+                else if packet.sequence == 0 { &a0 } else { &a1 };
+            assert_eq!(packet.bytes, reference.bytes);
+            assert_eq!(packet.sequence, reference.sequence);
+            assert_eq!(frame.sequence, reference.sequence);
+        }
     }
 
     #[test]
