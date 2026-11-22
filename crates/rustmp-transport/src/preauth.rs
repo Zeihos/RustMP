@@ -81,6 +81,7 @@ pub struct RetryResult {
     pub disconnected: Vec<SocketAddr>,
 }
 
+#[derive(Clone)]
 struct Peer {
     created: Instant,
     incoming: ReceiveWindow,
@@ -164,6 +165,8 @@ impl Peer {
 pub struct PreAuthExchange {
     handshakes: HandshakeCoordinator,
     peers: HashMap<SocketAddr, Peer>,
+    /// Fair resume point for the bounded per-tick retry scheduler.
+    retry_cursor: usize,
 }
 
 impl PreAuthExchange {
@@ -265,8 +268,15 @@ impl PreAuthExchange {
                 return Err(PreAuthError::UnexpectedFrame);
             }
         }
+        // Stage the peer and handshake attempt independently. Applying an
+        // ACK or moving the receive window must never survive a subsequent
+        // queue-capacity/encode error; neither may the auth phase advance if
+        // serializing its response fails. The transport is local-only, so a
+        // bounded copy is preferable to partially committed state.
+        let mut candidate_peer = state.clone();
+        let mut candidate_handshakes = self.handshakes.clone();
+        let state = &mut candidate_peer;
         let mut result = ExchangeResult::default();
-        let state = self.peers.get_mut(&peer).ok_or(PreAuthError::UnknownPeer)?;
         for range in packet.acknowledgements {
             for sequence in range.start..=range.end {
                 if state.outgoing.acknowledge(sequence) { result.acknowledged += 1; }
@@ -305,11 +315,11 @@ impl PreAuthExchange {
                 ReceiveDecision::TooFarAhead =>
                     return Err(PreAuthError::Reliability(ReliabilityError::TooFarAhead)),
             };
-            let response = match self.handshakes.phase(peer) {
+            let response = match candidate_handshakes.phase(peer) {
                 Some(HandshakePhase::AwaitAuthResponse) =>
-                    self.handshakes.receive_auth_response(peer, &frame.payload, now),
+                    candidate_handshakes.receive_auth_response(peer, &frame.payload, now),
                 Some(HandshakePhase::AwaitClientConfirmation) =>
-                    match self.handshakes.receive_confirmation(peer, &frame.payload, now) {
+                    match candidate_handshakes.receive_confirmation(peer, &frame.payload, now) {
                         Ok(_profile) => {
                             state.remember(frame.sequence, &frame.payload);
                             result.transport_confirmed = true;
@@ -330,6 +340,11 @@ impl PreAuthExchange {
                 }
             }
         }
+        // Commit together only after the complete decoded datagram succeeds.
+        // A genuine authentication/confirmation failure above intentionally
+        // disconnects the peer (existing policy), rather than rolling back.
+        self.handshakes = candidate_handshakes;
+        self.peers.insert(peer, candidate_peer);
         Ok(result)
     }
 
@@ -351,8 +366,16 @@ impl PreAuthExchange {
             result.disconnected.push(addr);
         }
         let addrs: Vec<_> = self.peers.keys().copied().collect();
-        for addr in addrs {
+        if addrs.is_empty() {
+            self.retry_cursor = 0;
+            return result;
+        }
+        let start = self.retry_cursor % addrs.len();
+        let mut visited = 0usize;
+        for index in 0..addrs.len() {
             if result.packets.len() >= MAX_RESEND_DATAGRAMS_PER_POLL { break; }
+            visited += 1;
+            let addr = addrs[(start + index) % addrs.len()];
             let Some(state) = self.peers.get_mut(&addr) else { continue };
             let available = MAX_RESEND_DATAGRAMS_PER_POLL - result.packets.len();
             let batch = state.outgoing.poll_retries(now, MAX_RETRIES_PER_POLL.min(available));
@@ -375,6 +398,9 @@ impl PreAuthExchange {
                 }
             }
         }
+        // Rotate past the peers inspected in this poll, so a flood of
+        // eligible retries cannot permanently starve the tail of the map.
+        self.retry_cursor = (start + visited) % addrs.len();
         result
     }
 }
@@ -639,6 +665,119 @@ mod tests {
         assert_eq!(retry.len(),1);
         assert_eq!(decode_datagram(&retry[0].bytes).unwrap().frames[0].payload,
             decode_datagram(&first).unwrap().frames[0].payload);
+    }
+
+    #[test]
+    fn retry_scheduler_fairly_visits_peers_beyond_global_packet_cap() {
+        use std::collections::HashSet;
+        let now=Instant::now();
+        let count=MAX_RESEND_DATAGRAMS_PER_POLL+8;
+        let mut offline=OfflineGateway::new(count);
+        let mut e=PreAuthExchange::new();
+        for n in 0..count {
+            // Distinct IPv4 loopback IPs avoid the separate offline per-IP
+            // security cap; this tests scheduler fairness, not flood limits.
+            let addr=SocketAddr::from(([127,0,(n+1) as u8,1],21000+n as u16));
+            open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+            e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+        }
+        assert_eq!(e.len(),count);
+        let first=e.poll_retries(now+PREAUTH_RETRY_DELAY).packets;
+        let second=e.poll_retries(now+PREAUTH_RETRY_DELAY*2).packets;
+        assert_eq!(first.len(),MAX_RESEND_DATAGRAMS_PER_POLL);
+        assert_eq!(second.len(),MAX_RESEND_DATAGRAMS_PER_POLL);
+        let first_peers:HashSet<_>=first.iter().map(|item|item.peer).collect();
+        let second_peers:HashSet<_>=second.iter().map(|item|item.peer).collect();
+        assert_eq!(first_peers.len(),MAX_RESEND_DATAGRAMS_PER_POLL);
+        assert_eq!(second_peers.len(),MAX_RESEND_DATAGRAMS_PER_POLL);
+        let served:HashSet<_>=first_peers.union(&second_peers).copied().collect();
+        assert_eq!(served.len(),count); // no peer is permanently starved
+        for resend in first.iter().chain(second.iter()) {
+            let decoded=decode_datagram(&resend.bytes).unwrap();
+            assert_eq!(decoded.frames[0].sequence,0);
+        }
+    }
+
+    #[test]
+    fn ack_queue_capacity_failure_does_not_acknowledge_or_consume_sequence() {
+        let now=Instant::now();
+        let addr=peer(12400);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::Samp037,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[8],b"",server(),0,0,None,now).unwrap();
+
+        let state=e.peers.get_mut(&addr).unwrap();
+        for n in 0..crate::reliability::MAX_ACK_BATCH {
+            state.acks.mark((1000+n) as u16).unwrap();
+        }
+        assert_eq!(state.acks.len(),crate::reliability::MAX_ACK_BATCH);
+        let valid=packet(1,&confirm(LegacyWireProfile::Samp037),&[0]);
+        assert_eq!(e.ingest(addr,&valid,now),
+            Err(PreAuthError::Reliability(ReliabilityError::QueueFull)));
+        let state=e.peers.get(&addr).unwrap();
+        assert_eq!(state.incoming.next_expected(),1); // still awaits #1
+        assert_eq!(state.acks.len(),crate::reliability::MAX_ACK_BATCH);
+        assert_eq!(e.pending_retries(addr),Some(1)); // piggyback ACK rolled back
+        assert_eq!(e.phase(addr),Some(HandshakePhase::AwaitClientConfirmation));
+
+        // Free capacity and resend exactly the same valid confirmation.
+        e.peers.get_mut(&addr).unwrap().acks.take(crate::reliability::MAX_ACK_BATCH);
+        let completed=e.ingest(addr,&valid,now).unwrap();
+        assert_eq!(completed.acknowledged,1);
+        assert!(completed.transport_confirmed);
+        assert_eq!(e.pending_retries(addr),Some(0));
+    }
+
+    #[test]
+    fn failed_outbound_encoding_does_not_advance_openmp_auth_phase() {
+        let now=Instant::now();
+        let addr=peer(12401);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::OpenMpRakNet,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[11],b"",server(),0,0,
+            Some(AuthPair {
+                challenge:b"C".to_vec(),expected_response:b"R".to_vec(),
+            }),now).unwrap();
+        let state=e.peers.get_mut(&addr).unwrap();
+        for _ in 1..crate::reliability::MAX_IN_FLIGHT {
+            state.outgoing.track_sent(&[99],now).unwrap();
+        }
+        assert_eq!(e.pending_retries(addr),Some(crate::reliability::MAX_IN_FLIGHT));
+        let auth=packet(1,b"\x0c\x01R",&[]);
+        assert_eq!(e.ingest(addr,&auth,now),
+            Err(PreAuthError::Reliability(ReliabilityError::QueueFull)));
+        assert_eq!(e.phase(addr),Some(HandshakePhase::AwaitAuthResponse));
+        assert_eq!(e.pending_retries(addr),Some(crate::reliability::MAX_IN_FLIGHT));
+        assert_eq!(e.peers.get(&addr).unwrap().incoming.next_expected(),1);
+
+        // No valid auth packet was consumed. After releasing one test-only
+        // outbound message, the same auth response must be accepted.
+        assert!(e.peers.get_mut(&addr).unwrap().outgoing.acknowledge(1));
+        let result=e.ingest(addr,&auth,now).unwrap();
+        assert_eq!(result.outgoing.len(),1);
+        assert_eq!(e.phase(addr),Some(HandshakePhase::AwaitClientConfirmation));
+        assert_eq!(e.peers.get(&addr).unwrap().incoming.next_expected(),2);
+    }
+
+    #[test]
+    fn invalid_auth_still_closes_attempt_instead_of_committing_any_staged_state() {
+        let now=Instant::now();
+        let addr=peer(12402);
+        let mut offline=OfflineGateway::new(2);
+        open(&mut offline,addr,LegacyWireProfile::OpenMpRakNet,now);
+        let mut e=PreAuthExchange::new();
+        e.begin(&offline,addr,&[11],b"",server(),0,0,
+            Some(AuthPair {
+                challenge:b"C".to_vec(),expected_response:b"RIGHT".to_vec(),
+            }),now).unwrap();
+        let forged=packet(1,b"\x0c\x05WRONG",&[0]);
+        assert_eq!(e.ingest(addr,&forged,now),
+            Err(PreAuthError::Handshake(HandshakeError::InvalidAuthResponse)));
+        assert_eq!(e.len(),0);
+        assert_eq!(e.phase(addr),None);
+        assert_eq!(e.pending_retries(addr),None);
     }
 
     #[test]

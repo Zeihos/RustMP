@@ -172,7 +172,7 @@ pub fn decode_new_incoming(
     Ok(SocketAddr::new(addr,port))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HandshakeCoordinator {
     pending: HashMap<SocketAddr, Attempt>,
 }
