@@ -217,6 +217,11 @@ fn dispatch_datagram(
     // would allocate a pending peer and send OPEN_CONNECTION_REPLY before
     // validating the cookie. Default (non-experimental) mode is untouched.
     if let Some(router) = experimental.as_deref_mut() {
+        // An original SA-MP offline open starts a new diagnostic attempt.
+        // Discard the final ACK of a prior attempt from this exact endpoint.
+        if matches!(incoming, [16, _, _]) && peer.ip().is_loopback() && peer.is_ipv4() {
+            router.on_samp_offline_open(peer);
+        }
         if let Err(reply) = router.check_cookie(incoming, peer, now, offline) {
             return if reply.is_empty() { Vec::new() } else { vec![reply] };
         }
@@ -431,6 +436,52 @@ mod tests {
         assert_eq!(&reply[..request.len()], request);
         assert_eq!(&reply[12..14], &0u16.to_le_bytes());
         assert_eq!(offline.pending_count(), 1); // Query never allocates peers.
+    }
+
+    #[test]
+    fn dispatch_new_offline_open_invalidates_old_final_ack_cache() {
+        use rustmp_protocol::legacy_frame::{encode_datagram, Frame, Reliability};
+        let now=Instant::now();
+        let peer:SocketAddr="127.0.0.1:54881".parse().unwrap();
+        let bound:SocketAddr="127.0.0.1:7777".parse().unwrap();
+        let world=World::new(Config::default());
+        let mut limits=HashMap::new();
+        let mut offline=OfflineGateway::new(5);
+        let mut router=ExperimentalPreAuth::new();
+        let encode=|seq:u16, payload:&[u8], ack:&[u16]| {
+            encode_datagram(ack,&[Frame {
+                sequence:seq,reliability:Reliability::Reliable,
+                ordering:None,split:None,
+                payload_bits:(payload.len()*8) as u16,
+                payload:payload.to_vec(),
+            }]).unwrap()
+        };
+
+        assert_eq!(dispatch_datagram(&[16,0,0],peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound),vec![vec![17,0]]);
+        let initial=encode(0,&[8],&[]);
+        assert_eq!(dispatch_datagram(&initial,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound).len(),1);
+
+        let confirmation=[26,127,0,0,1,0x61,0x1e];
+        let final_packet=encode(1,&confirmation,&[0]);
+        let completed=dispatch_datagram(&final_packet,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound);
+        assert_eq!(completed.len(),1);
+        assert_eq!(router.completed_ack_count(),1);
+        let retry=encode(1,&confirmation,&[]);
+        assert_eq!(dispatch_datagram(&retry,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound),completed);
+
+        // Critical integration invariant: a fresh offline OPEN must invoke
+        // on_samp_offline_open BEFORE OfflineGateway sends its reply.
+        assert_eq!(dispatch_datagram(&[16,0,0],peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound),vec![vec![17,0]]);
+        assert_eq!(router.completed_ack_count(),0);
+        assert!(dispatch_datagram(&retry,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound).is_empty());
+        assert_eq!(dispatch_datagram(&initial,peer,now,&world,
+            &mut limits,&mut offline,Some(&mut router),bound).len(),1);
     }
 
     #[test]
