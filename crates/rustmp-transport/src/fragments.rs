@@ -93,6 +93,16 @@ impl SplitAssembler {
             if self.groups.len() >= MAX_SPLIT_GROUPS {
                 return Err(SplitError::TooManyGroups);
             }
+            // Do not allocate a group until its FIRST fragment can actually
+            // fit. Previously a packet rejected by the global byte budget
+            // left behind a zero-byte group, allowing repeated unique split
+            // IDs to exhaust MAX_SPLIT_GROUPS with no accepted payloads.
+            let incoming = frame.payload.len();
+            if incoming > MAX_GROUP_BYTES
+                || self.buffered_bytes + incoming > MAX_BUFFERED_BYTES
+            {
+                return Err(SplitError::MemoryLimit);
+            }
             self.groups.insert(split.id, SplitGroup {
                 created: now,
                 reliability: frame.reliability,
@@ -275,6 +285,62 @@ mod tests {
         assert!(rejected);
         assert!(a.buffered_bytes() <= MAX_GROUP_BYTES);
         assert_eq!(a.pending_groups(), 1);
+    }
+
+    #[test]
+    fn rejected_new_split_does_not_allocate_empty_group_at_global_memory_limit() {
+        let now = Instant::now();
+        let mut assembler = SplitAssembler::new();
+        let block = vec![0x42; 1024];
+        // Eight incomplete 17-part groups, each with 16 of 17 chunks,
+        // consume exactly 128 KiB without exceeding the 64 KiB group limit.
+        for id in 0..8u16 {
+            for index in 0..16 {
+                assembler.insert(fragment(id, index, 17, &block), now).unwrap();
+            }
+        }
+        assert_eq!(assembler.buffered_bytes(), MAX_BUFFERED_BYTES);
+        assert_eq!(assembler.pending_groups(), 8);
+
+        for id in 100..(100 + MAX_SPLIT_GROUPS as u16 * 2) {
+            assert_eq!(
+                assembler.insert(fragment(id, 0, 2, b"x"), now),
+                Err(SplitError::MemoryLimit),
+            );
+        }
+        // Before the fix these failed attempts left many empty groups and
+        // eventually returned TooManyGroups even though no bytes were kept.
+        assert_eq!(assembler.pending_groups(), 8);
+        assert_eq!(assembler.buffered_bytes(), MAX_BUFFERED_BYTES);
+        // An exact duplicate must remain idempotent even at the byte cap.
+        assert_eq!(assembler.insert(fragment(0, 0, 17, &block), now), Ok(None));
+        assert_eq!(assembler.buffered_bytes(), MAX_BUFFERED_BYTES);
+        assert_eq!(assembler.pending_groups(), 8);
+    }
+
+    #[test]
+    fn memory_pressure_recovery_accepts_new_group_after_old_group_expires() {
+        let now = Instant::now();
+        let mut assembler = SplitAssembler::new();
+        let block = vec![0x55; 1024];
+        for id in 0..8u16 {
+            for index in 0..16 {
+                assembler.insert(fragment(id, index, 17, &block), now).unwrap();
+            }
+        }
+        assert_eq!(assembler.insert(fragment(41, 0, 2, b"first"), now),
+            Err(SplitError::MemoryLimit));
+        assert_eq!(assembler.pending_groups(), 8);
+        assert_eq!(assembler.cleanup(now + SPLIT_TIMEOUT), 8);
+        assert_eq!(assembler.pending_groups(), 0);
+        assert_eq!(assembler.buffered_bytes(), 0);
+        assert_eq!(assembler.insert(fragment(41, 0, 2, b"first"),
+            now + SPLIT_TIMEOUT), Ok(None));
+        let complete = assembler.insert(fragment(41, 1, 2, b"second"),
+            now + SPLIT_TIMEOUT).unwrap().unwrap();
+        assert_eq!(complete.payload, b"firstsecond");
+        assert_eq!(assembler.pending_groups(), 0);
+        assert_eq!(assembler.buffered_bytes(), 0);
     }
 
     #[test]

@@ -108,13 +108,14 @@ impl OutboundReliability {
     /// Never create a new message number or reset retry counters.
     /// A minimum delay bounds amplification under repeated duplicate traffic.
     pub fn expedite_oldest(&mut self, now: Instant, minimum_delay: Duration) -> Option<Resend> {
+        // Choose the OLDEST ELIGIBLE packet, not the oldest packet
+        // unconditionally. An exhausted/too-recent oldest message must not
+        // block fast retransmission of another eligible reliable response.
+        let cap = self.max_retries;
         let (&sequence, entry) = self.outstanding.iter_mut()
+            .filter(|(_, entry)| entry.retries < cap
+                && now.saturating_duration_since(entry.last_sent) >= minimum_delay)
             .min_by_key(|(_, entry)| entry.last_sent)?;
-        if now.saturating_duration_since(entry.last_sent) < minimum_delay
-            || entry.retries >= self.max_retries
-        {
-            return None;
-        }
         entry.retries += 1;
         entry.last_sent = now;
         Some(Resend { sequence, bytes: entry.bytes.clone(), attempt: entry.retries })
@@ -307,6 +308,44 @@ mod tests {
         assert!(q.acknowledge(0));
         assert_eq!(q.expedite_oldest(now+Duration::from_secs(2),
             Duration::from_millis(100)),None);
+    }
+
+    #[test]
+    fn expedited_retry_skips_exhausted_oldest_and_serves_next_eligible() {
+        let now = Instant::now();
+        let mut tx = OutboundReliability::new(Duration::from_millis(300), 1);
+        assert_eq!(tx.track_sent(b"first", now), Ok(0));
+        assert_eq!(tx.track_sent(b"second", now + Duration::from_millis(50)), Ok(1));
+
+        let one = tx.expedite_oldest(now + Duration::from_millis(100),
+            Duration::from_millis(100)).unwrap();
+        assert_eq!((one.sequence, one.attempt), (0, 1));
+        // First is at its retry cap. The second becomes eligible on its own
+        // timeline and MUST NOT be starved by the exhausted first.
+        assert_eq!(tx.expedite_oldest(now + Duration::from_millis(149),
+            Duration::from_millis(100)), None);
+        let two = tx.expedite_oldest(now + Duration::from_millis(150),
+            Duration::from_millis(100)).unwrap();
+        assert_eq!((two.sequence, two.attempt), (1, 1));
+        assert_eq!(two.bytes, b"second");
+        assert_eq!(tx.expedite_oldest(now + Duration::from_millis(300),
+            Duration::from_millis(100)), None);
+        assert_eq!(tx.pending_count(), 2); // Retry does not acknowledge data.
+    }
+
+    #[test]
+    fn expedited_retry_uses_oldest_eligible_not_recently_retried_head() {
+        let now = Instant::now();
+        let mut tx = OutboundReliability::new(Duration::from_millis(300), 3);
+        assert_eq!(tx.track_sent(b"first", now), Ok(0));
+        assert_eq!(tx.track_sent(b"second", now + Duration::from_millis(1)), Ok(1));
+        assert_eq!(tx.expedite_oldest(now + Duration::from_millis(100),
+            Duration::from_millis(100)).unwrap().sequence, 0);
+        // The head has just been retried and is ineligible, but #1 is due.
+        assert_eq!(tx.expedite_oldest(now + Duration::from_millis(101),
+            Duration::from_millis(100)).unwrap().sequence, 1);
+        assert_eq!(tx.expedite_oldest(now + Duration::from_millis(101),
+            Duration::from_millis(100)), None);
     }
 
     #[test]
